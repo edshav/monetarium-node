@@ -385,3 +385,35 @@ func TestUtxoViewpointCoinTypeTracking(t *testing.T) {
 		t.Errorf("Expected 0 count for unknown coin type, got %d", unknownCount)
 	}
 }
+
+// TestAddRegularInputUtxosOnlyReferenced ensures that only the outputs of
+// in-flight regular transactions that are actually referenced by later regular
+// transactions in the same block are added to the view.
+func TestAddRegularInputUtxosOnlyReferenced(t *testing.T) {
+	origin := wire.NewMsgTx()
+	origin.AddTxOut(wire.NewTxOut(10, []byte{0x51}))
+	origin.AddTxOut(wire.NewTxOut(20, []byte{0x51}))
+	originHash := origin.TxHash()
+	spender := wire.NewMsgTx()
+	spender.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash:  originHash,
+		Index: 1,
+	}})
+	block := dcrutil.NewBlock(&wire.MsgBlock{
+		Header:       wire.BlockHeader{Height: 100},
+		Transactions: []*wire.MsgTx{wire.NewMsgTx(), origin, spender},
+	})
+
+	view := NewUtxoViewpoint(nil)
+	view.addRegularInputUtxos(block, true)
+
+	referenced := wire.OutPoint{Hash: originHash, Index: 1}
+	if entry := view.LookupEntry(referenced); entry == nil || entry.IsSpent() {
+		t.Fatalf("referenced in-flight output %v not available in view",
+			referenced)
+	}
+	unreferenced := wire.OutPoint{Hash: originHash, Index: 0}
+	if entry := view.LookupEntry(unreferenced); entry != nil {
+		t.Fatalf("unreferenced in-flight output %v added to view", unreferenced)
+	}
+}
