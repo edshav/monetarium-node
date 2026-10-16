@@ -408,8 +408,8 @@ func deserializeOutPoints(data []byte) ([]wire.OutPoint, error) {
 // This is called when a block is connected to the main chain.
 //
 // For each SSFee transaction in the block:
-//  1. Extract the consolidation address from output[0]
-//  2. Create index key: "sf" + coinType + addressHash160
+//  1. Extract the address hash160 from the payment at output[1]
+//  2. Create index key: "sf" + feeType + coinType + addressHash160
 //  3. Add the outpoint to the list for this key
 //
 // This is part of the Indexer interface implementation via ProcessNotification.
@@ -431,10 +431,10 @@ func (idx *SSFeeIndex) ConnectBlock(dbTx database.Tx, block *dcrutil.Block) erro
 
 		ssfeeCount++
 
-		// Ensure SSFee has at least 2 outputs
+		// Skip an SSFee without the payment output at index 1, since there
+		// is nothing to index.
 		if len(stx.MsgTx().TxOut) < 2 {
-			return fmt.Errorf("SSFee transaction %v has insufficient outputs (need 2, got %d)",
-				stx.Hash(), len(stx.MsgTx().TxOut))
+			continue
 		}
 
 		// SSFee standard format: output[0] = OP_RETURN marker, output[1] = payment
@@ -513,8 +513,8 @@ func (idx *SSFeeIndex) ConnectBlock(dbTx database.Tx, block *dcrutil.Block) erro
 // This is called when a block is disconnected from the main chain (reorg).
 //
 // For each SSFee transaction in the block:
-//  1. Extract the consolidation address from output[0]
-//  2. Create index key: "sf" + coinType + addressHash160
+//  1. Extract the address hash160 from the payment at output[1]
+//  2. Create index key: "sf" + feeType + coinType + addressHash160
 //  3. Remove the outpoint from the list for this key
 //
 // This is part of the Indexer interface implementation via ProcessNotification.
@@ -532,10 +532,10 @@ func (idx *SSFeeIndex) DisconnectBlock(dbTx database.Tx, block *dcrutil.Block) e
 			continue
 		}
 
-		// Ensure SSFee has at least 2 outputs
+		// Skip an SSFee without the payment output at index 1, since there
+		// is nothing to index.
 		if len(stx.MsgTx().TxOut) < 2 {
-			return fmt.Errorf("SSFee transaction %v has insufficient outputs (need 2, got %d)",
-				stx.Hash(), len(stx.MsgTx().TxOut))
+			continue
 		}
 
 		// SSFee standard format: output[0] = OP_RETURN marker, output[1] = payment
@@ -564,8 +564,6 @@ func (idx *SSFeeIndex) DisconnectBlock(dbTx database.Tx, block *dcrutil.Block) e
 		if err != nil {
 			return fmt.Errorf("failed to deserialize existing outpoints: %w", err)
 		}
-
-		_ = paymentIndex // Used for clarity, outpoint index is always 1
 
 		// Remove this outpoint from the list
 		targetHash := *stx.Hash()
