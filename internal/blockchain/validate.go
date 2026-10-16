@@ -2433,7 +2433,11 @@ func (b *BlockChain) checkBlockContext(block *dcrutil.Block, prevNode *blockNode
 	// Pass prevNode instead of blockHeight to avoid lock re-acquisition
 	err = CheckSKAEmissionInBlock(block, prevNode, b, b.chainParams)
 	if err != nil {
-		return err
+		// Conflicts with the recorded emission state are not rule errors.
+		if isSKAEmissionStateError(err) {
+			return err
+		}
+		return ruleError(ErrInvalidSKAEmission, err.Error())
 	}
 
 	return nil
