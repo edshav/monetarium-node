@@ -2553,7 +2553,7 @@ func getSSFeeType(tx *wire.MsgTx) (string, error) {
 //   - Null input: Has ValueIn set to fee amount, creates new UTXO
 //   - Real input: References existing UTXO, augments it with fee
 //
-// - Outputs: Distribution to stakers (for staker SSFee) or miner (for miner SSFee)
+// - Outputs: One payment output (to a consolidation address or the miner) plus OP_RETURN outputs
 // - OP_RETURN marker: Contains "SF" for staker fees or "MF" for miner fees
 // - Coin Type: All outputs must be the same coin type
 //
@@ -2561,8 +2561,9 @@ func getSSFeeType(tx *wire.MsgTx) (string, error) {
 // - Each SSFee tx distributes fees for exactly one coin type
 // - For null input SSFee: output value == expected fee
 // - For augmented SSFee: output value == input value + expected fee
+// - Each SSFee pays a single output that is not OP_RETURN
 // - Staker SSFee (SF) can distribute any coin type including VAR
-// - Staker SSFee (SF) pays a single output to a voter consolidation address
+// - Staker SSFee (SF) pays the consolidation script of a voter
 // - Miner SSFee (MF) distributes non-VAR only (VAR miner fees go to coinbase)
 // - All coin types with staker fees have corresponding SSFee transactions
 // - All non-VAR coin types with miner fees have corresponding SSFee transactions
@@ -2689,15 +2690,22 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			return ruleError(ErrStakeFees, err.Error())
 		}
 
-		// Get the coin type from the first non-OP_RETURN output
+		// An SSFee pays a single output, which is not OP_RETURN, and takes
+		// its coin type from it.
 		var coinType cointype.CoinType
+		var numPayments int
 		for _, out := range ssFeeTx.TxOut {
 			// Skip OP_RETURN outputs
 			if len(out.PkScript) > 0 && out.PkScript[0] == txscript.OP_RETURN {
 				continue
 			}
 			coinType = out.CoinType
-			break
+			numPayments++
+		}
+		if numPayments != 1 {
+			return ruleError(ErrStakeFees,
+				fmt.Sprintf("SSFee transaction has %d payment outputs, "+
+					"expected 1", numPayments))
 		}
 
 		// Determine if this is null-input (creating new) or augmented (reusing UTXO)
@@ -2832,12 +2840,6 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 					continue
 				}
 
-				// A staker SSFee pays its recipient with a single output.
-				if recipientHash160 != nil {
-					return ruleError(ErrStakeFees,
-						"staker SSFee transaction has more than one payment output")
-				}
-
 				recipientHash160, err = extractHash160FromPkScript(out.PkScript)
 				if err != nil {
 					return ruleError(ErrStakeFees,
@@ -2874,11 +2876,6 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 					}
 					totalOutputValue += outValue
 				}
-			}
-
-			if recipientHash160 == nil {
-				return ruleError(ErrStakeFees,
-					"staker SSFee transaction has no payment output")
 			}
 
 			// Verify recipient matches at least one voter's consolidation address

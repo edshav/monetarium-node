@@ -12,6 +12,7 @@ import (
 
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/blockchain/standalone"
+	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript"
@@ -108,7 +109,9 @@ func stakerSSFeeTestTxns(t *testing.T, coinType cointype.CoinType,
 
 // TestSSFeeAcceptsTemplatePayouts ensures SSFee transactions laid out as the
 // block template generator does, one payout each, distribute the fees of a
-// block with one vote and with votes of several consolidation addresses.
+// block with one vote and with votes of several consolidation addresses, with
+// null and augmented inputs and with a miner payout to a script without an
+// address.
 func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 	addrA := []byte{1: 0xaa, 19: 0x01}
 	addrB := []byte{1: 0xbb, 19: 0x02}
@@ -121,10 +124,12 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 		standalone.SSVMonetarium)
 
 	tests := []struct {
-		name     string
-		coinType cointype.CoinType
-		votes    [][]byte
-		fee      int64
+		name        string
+		coinType    cointype.CoinType
+		votes       [][]byte
+		fee         int64
+		minerScript []byte
+		augmented   bool
 	}{{
 		name:     "VAR fees, one vote",
 		coinType: cointype.CoinTypeVAR,
@@ -145,6 +150,24 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 		coinType: 1,
 		votes:    [][]byte{addrC, addrA, addrB, addrA, addrC},
 		fee:      1_000_000_000_000_000_007,
+	}, {
+		name:        "SKA1 fees, miner without an address",
+		coinType:    1,
+		votes:       [][]byte{addrA},
+		fee:         1_000_000_000_000_000_007,
+		minerScript: []byte{txscript.OP_SSGEN, txscript.OP_TRUE},
+	}, {
+		name:      "VAR fees, augmented outputs",
+		coinType:  cointype.CoinTypeVAR,
+		votes:     [][]byte{addrA, addrB, addrA},
+		fee:       2_007,
+		augmented: true,
+	}, {
+		name:      "SKA1 fees, augmented outputs",
+		coinType:  1,
+		votes:     [][]byte{addrC, addrA, addrB, addrA, addrC},
+		fee:       1_000_000_000_000_000_007,
+		augmented: true,
 	}}
 
 	for _, test := range tests {
@@ -161,9 +184,36 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 			ssFeeTxns := stakerSSFeeTestTxns(t, test.coinType, votes,
 				stakerFees.GetBig(test.coinType))
 			if test.coinType.IsSKA() {
+				payScript := minerScript
+				if test.minerScript != nil {
+					payScript = test.minerScript
+				}
 				ssFeeTxns = append(ssFeeTxns, ssFeeTestTx(test.coinType,
-					stake.CreateMinerSSFeeMarker(200), minerScript,
+					stake.CreateMinerSSFeeMarker(200), payScript,
 					minerFees.GetBig(test.coinType)))
+			}
+
+			// Make each SSFee add its fee to an earlier output, as the
+			// template generator does when it finds one.
+			if test.augmented {
+				for i, tx := range ssFeeTxns {
+					prev := big.NewInt(int64(1_000 + i))
+					txIn := tx.TxIn[0]
+					txIn.PreviousOutPoint = wire.OutPoint{
+						Hash:  chainhash.Hash{byte(i + 1)},
+						Index: 1,
+						Tree:  wire.TxTreeStake,
+					}
+					txIn.BlockHeight = 100
+					payOut := tx.TxOut[1]
+					if test.coinType.IsSKA() {
+						txIn.SKAValueIn = prev
+						payOut.SKAValue = new(big.Int).Add(payOut.SKAValue, prev)
+					} else {
+						txIn.ValueIn = prev.Int64()
+						payOut.Value += prev.Int64()
+					}
+				}
 			}
 
 			err := (&BlockChain{}).validateSSFeeTxns(nil, nil, votes,
