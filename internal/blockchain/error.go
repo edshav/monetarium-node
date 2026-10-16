@@ -417,6 +417,12 @@ const (
 	// transaction tree.
 	ErrStakeFees = ErrorKind("ErrStakeFees")
 
+	// ErrBadSSFeeInput indicates an SSFee transaction with a real input spends
+	// an output that was not created by an SSFee transaction of the same type
+	// (staker or miner), pays to a script other than the one of the output it
+	// spends, or has no output other than an OP_RETURN output.
+	ErrBadSSFeeInput = ErrorKind("ErrBadSSFeeInput")
+
 	// ErrNoStakeTx indicates there were no stake transactions found in a
 	// block after stake validation height.
 	ErrNoStakeTx = ErrorKind("ErrNoStakeTx")

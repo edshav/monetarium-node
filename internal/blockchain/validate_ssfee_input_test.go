@@ -1,0 +1,409 @@
+// Copyright (c) 2026 The Monetarium developers
+// Use of this source code is governed by an ISC
+// license that can be found in the LICENSE file.
+
+package blockchain
+
+import (
+	"bytes"
+	"math/big"
+	"testing"
+
+	"github.com/monetarium/monetarium-node/blockchain/stake"
+	"github.com/monetarium/monetarium-node/blockchain/standalone"
+	"github.com/monetarium/monetarium-node/chaincfg"
+	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
+	"github.com/monetarium/monetarium-node/cointype"
+	"github.com/monetarium/monetarium-node/dcrutil"
+	"github.com/monetarium/monetarium-node/txscript"
+	"github.com/monetarium/monetarium-node/wire"
+)
+
+// ssFeeTestOutput describes an existing SSFee output in a test UTXO view.
+type ssFeeTestOutput struct {
+	outpoint wire.OutPoint
+	entry    *UtxoEntry
+}
+
+// newSSFeeTestOutput returns an unspent output of an SSFee transaction mined at
+// the given height that pays value of the given coin type to pkScript.
+func newSSFeeTestOutput(coinType cointype.CoinType, value int64, pkScript []byte,
+	height int64) ssFeeTestOutput {
+
+	entry := &UtxoEntry{
+		coinType:      coinType,
+		pkScript:      pkScript,
+		blockHeight:   uint32(height),
+		blockIndex:    3,
+		scriptVersion: 0,
+		packedFlags:   encodeUtxoFlags(false, false, stake.TxTypeSSFee),
+	}
+	if coinType.IsSKA() {
+		entry.skaAmount = big.NewInt(value)
+	} else {
+		entry.amount = value
+	}
+	return ssFeeTestOutput{
+		outpoint: wire.OutPoint{Hash: chainhash.Hash{0x5f}, Index: 1,
+			Tree: wire.TxTreeStake},
+		entry: entry,
+	}
+}
+
+// view returns a UTXO view that contains only the output.
+func (o ssFeeTestOutput) view() *UtxoViewpoint {
+	view := NewUtxoViewpoint(nil)
+	view.Entries()[o.outpoint] = o.entry
+	return view
+}
+
+// spendingTxIn returns an input spending the output with a correct fraud proof.
+func (o ssFeeTestOutput) spendingTxIn() *wire.TxIn {
+	txIn := &wire.TxIn{
+		PreviousOutPoint: o.outpoint,
+		Sequence:         wire.MaxTxInSequenceNum,
+		BlockHeight:      uint32(o.entry.BlockHeight()),
+		BlockIndex:       o.entry.BlockIndex(),
+	}
+	if o.entry.CoinType().IsSKA() {
+		txIn.SKAValueIn = o.entry.SKAAmount()
+	} else {
+		txIn.ValueIn = o.entry.Amount()
+	}
+	return txIn
+}
+
+// newTestTxOut returns an output paying value of the given coin type to
+// pkScript.
+func newTestTxOut(coinType cointype.CoinType, value int64, pkScript []byte) *wire.TxOut {
+	txOut := &wire.TxOut{CoinType: coinType, PkScript: pkScript}
+	if coinType.IsSKA() {
+		txOut.SKAValue = big.NewInt(value)
+	} else {
+		txOut.Value = value
+	}
+	return txOut
+}
+
+// newSSFeeTestTx returns an SSFee transaction with the given input that carries
+// the marker and pays value to pkScript, laid out as the miner lays it out.
+func newSSFeeTestTx(txIn *wire.TxIn, coinType cointype.CoinType, marker []byte,
+	value int64, pkScript []byte) *wire.MsgTx {
+
+	tx := wire.NewMsgTx()
+	tx.Version = wire.TxVersionTreasury
+	tx.AddTxIn(txIn)
+	tx.AddTxOut(newTestTxOut(coinType, 0, marker))
+	tx.AddTxOut(newTestTxOut(coinType, value, pkScript))
+	return tx
+}
+
+// TestCheckTransactionInputsAugmentedSSFee ensures CheckTransactionInputs
+// accepts an SSFee transaction that spends an earlier SSFee output and pays
+// back to its script, including right after that output is created.
+func TestCheckTransactionInputsAugmentedSSFee(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	subsidyCache := standalone.NewSubsidyCache(params)
+	const originHeight = 1000
+	const ska1 = cointype.CoinType(1)
+	if !params.IsSKACoinTypeActive(ska1) {
+		t.Fatalf("test requires %v to be active on simnet", ska1)
+	}
+
+	stakerScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x11}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x22}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		coinType cointype.CoinType
+		marker   []byte
+		pkScript []byte
+	}{{
+		name:     "VAR staker",
+		coinType: cointype.CoinTypeVAR,
+		marker:   stake.CreateStakerSSFeeMarker(originHeight+1, 0),
+		pkScript: stakerScript,
+	}, {
+		name:     "SKA staker",
+		coinType: ska1,
+		marker:   stake.CreateStakerSSFeeMarker(originHeight+1, 0),
+		pkScript: stakerScript,
+	}, {
+		name:     "SKA miner",
+		coinType: ska1,
+		marker:   stake.CreateMinerSSFeeMarker(originHeight + 1),
+		pkScript: minerScript,
+	}}
+
+	// The maturity of OP_SSGEN tagged outputs is CoinbaseMaturity once the
+	// treasury agenda is active, so the next block only passes through the
+	// exemption for an SSFee spending an SSFee output.
+	if params.CoinbaseMaturity <= 1 {
+		t.Fatalf("test requires CoinbaseMaturity > 1, got %d",
+			params.CoinbaseMaturity)
+	}
+
+	for _, test := range tests {
+		prev := newSSFeeTestOutput(test.coinType, 5000, test.pkScript,
+			originHeight)
+		tx := newSSFeeTestTx(prev.spendingTxIn(), test.coinType, test.marker,
+			5000+700, test.pkScript)
+		if !stake.IsSSFee(tx) {
+			t.Fatalf("%s: test transaction is not an SSFee", test.name)
+		}
+
+		fee, err := CheckTransactionInputs(subsidyCache, dcrutil.NewTx(tx),
+			originHeight+1, prev.view(), true, params, nil, true, false,
+			standalone.SSVMonetarium)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", test.name, err)
+			continue
+		}
+		if fee.Sign() != 0 {
+			t.Errorf("%s: fee %v, want 0", test.name, fee)
+		}
+	}
+}
+
+// TestCheckTransactionInputsSpendMatureSSFeeOutput ensures CheckTransactionInputs
+// accepts a regular transaction that spends an SSFee output once the output has
+// reached the maturity required of OP_SSGEN tagged outputs.
+func TestCheckTransactionInputsSpendMatureSSFeeOutput(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	subsidyCache := standalone.NewSubsidyCache(params)
+	const originHeight = 1000
+	const ska1 = cointype.CoinType(1)
+
+	ssFeeScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x11}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payScript := ssFeeScript[1:] // the same P2PKH without the OP_SSGEN tag
+
+	for _, coinType := range []cointype.CoinType{cointype.CoinTypeVAR, ska1} {
+		for _, isTreasuryEnabled := range []bool{false, true} {
+			maturity := int64(params.SStxChangeMaturity)
+			if isTreasuryEnabled {
+				maturity = int64(params.CoinbaseMaturity)
+			}
+
+			prev := newSSFeeTestOutput(coinType, 5000, ssFeeScript, originHeight)
+			tx := wire.NewMsgTx()
+			tx.AddTxIn(prev.spendingTxIn())
+			tx.AddTxOut(newTestTxOut(coinType, 4000, payScript))
+
+			fee, err := CheckTransactionInputs(subsidyCache, dcrutil.NewTx(tx),
+				originHeight+maturity, prev.view(), true, params, nil,
+				isTreasuryEnabled, false, standalone.SSVMonetarium)
+			if err != nil {
+				t.Errorf("%v (treasury %v): unexpected error: %v", coinType,
+					isTreasuryEnabled, err)
+				continue
+			}
+			if fee.Cmp(big.NewInt(1000)) != 0 {
+				t.Errorf("%v (treasury %v): fee %v, want 1000", coinType,
+					isTreasuryEnabled, fee)
+			}
+		}
+	}
+}
+
+// TestCheckTransactionInputsNullInputSSFee ensures CheckTransactionInputs still
+// accepts SSFee transactions with a null input without consulting the UTXO
+// view, including ones whose null input carries a non-zero value.
+func TestCheckTransactionInputsNullInputSSFee(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	subsidyCache := standalone.NewSubsidyCache(params)
+	const height = 1000
+	const ska1 = cointype.CoinType(1)
+
+	pkScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x11}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		coinType cointype.CoinType
+		marker   []byte
+		valueIn  int64
+	}{{
+		name:     "VAR staker",
+		coinType: cointype.CoinTypeVAR,
+		marker:   stake.CreateStakerSSFeeMarker(height, 0),
+	}, {
+		name:     "SKA staker",
+		coinType: ska1,
+		marker:   stake.CreateStakerSSFeeMarker(height, 0),
+	}, {
+		name:     "SKA miner with non-zero SKAValueIn",
+		coinType: ska1,
+		marker:   stake.CreateMinerSSFeeMarker(height),
+		valueIn:  700,
+	}, {
+		name:     "SKA staker with non-zero SKAValueIn",
+		coinType: ska1,
+		marker:   stake.CreateStakerSSFeeMarker(height, 0),
+		valueIn:  700,
+	}}
+
+	for _, test := range tests {
+		tx := newNullInputSSFeeTestTx(test.coinType, test.marker, 700, pkScript)
+		if test.coinType.IsSKA() {
+			tx.TxIn[0].SKAValueIn = big.NewInt(test.valueIn)
+		} else {
+			tx.TxIn[0].ValueIn = test.valueIn
+		}
+		if !stake.IsSSFee(tx) {
+			t.Fatalf("%s: test transaction is not an SSFee", test.name)
+		}
+
+		fee, err := CheckTransactionInputs(subsidyCache, dcrutil.NewTx(tx),
+			height, NewUtxoViewpoint(nil), true, params, nil, true, false,
+			standalone.SSVMonetarium)
+		if err != nil {
+			t.Errorf("%s: unexpected error: %v", test.name, err)
+			continue
+		}
+		if fee.Sign() != 0 {
+			t.Errorf("%s: fee %v, want 0", test.name, fee)
+		}
+	}
+}
+
+// newNullInputSSFeeTestTx returns a null-input SSFee transaction that carries
+// the marker and pays value to pkScript.
+func newNullInputSSFeeTestTx(coinType cointype.CoinType, marker []byte,
+	value int64, pkScript []byte) *wire.MsgTx {
+
+	txIn := &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Index: wire.MaxPrevOutIndex},
+		Sequence:         wire.MaxTxInSequenceNum,
+		BlockHeight:      wire.NullBlockHeight,
+		BlockIndex:       wire.NullBlockIndex,
+	}
+	return newSSFeeTestTx(txIn, coinType, marker, value, pkScript)
+}
+
+// augmentingSSFeeTxIn returns the input of an SSFee transaction spending the
+// payment output of the SSFee transaction at the given position in the stake
+// tree of the block at the given height.
+func augmentingSSFeeTxIn(src *wire.MsgTx, height int64, index uint32) *wire.TxIn {
+	const paymentIdx = 1 // the layout of newSSFeeTestTx
+	txIn := &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: src.TxHash(), Index: paymentIdx,
+			Tree: wire.TxTreeStake},
+		Sequence:    wire.MaxTxInSequenceNum,
+		BlockHeight: uint32(height),
+		BlockIndex:  index,
+	}
+	if src.TxOut[paymentIdx].CoinType.IsSKA() {
+		txIn.SKAValueIn = new(big.Int).Set(src.TxOut[paymentIdx].SKAValue)
+	} else {
+		txIn.ValueIn = src.TxOut[paymentIdx].Value
+	}
+	return txIn
+}
+
+// TestValidateSSFeeTxnsAugmentedSameType ensures validateSSFeeTxns accepts
+// staker and miner SKA SSFee transactions that each augment an output of an
+// earlier SSFee transaction of the same type, each with one payment output.
+func TestValidateSSFeeTxnsAugmentedSameType(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	b := newFakeChain(params)
+	const ska1 = cointype.CoinType(1)
+
+	stakerHash := bytes.Repeat([]byte{0x11}, 20)
+	stakerScript, err := stake.ConsolidationAddrToPkScript(stakerHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	minerScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x22}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent block holds a staker and a miner SSFee.
+	srcSF := newNullInputSSFeeTestTx(ska1, stake.CreateStakerSSFeeMarker(1, 0),
+		5000, stakerScript)
+	srcMF := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(1),
+		3000, minerScript)
+	srcMsgBlock := &wire.MsgBlock{
+		Header:        wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1},
+		STransactions: []*wire.MsgTx{srcSF, srcMF},
+	}
+	srcNode := newBlockNode(&srcMsgBlock.Header, b.bestChain.Tip())
+	b.recentBlocks.Put(srcNode.hash, dcrutil.NewBlock(srcMsgBlock))
+
+	// The block holds a vote for the staker and the SSFee transactions that
+	// augment both outputs of the parent block with this block's fees.
+	totalFees := wire.NewFeesByType()
+	totalFees.Add(ska1, 1000)
+	work, stakeShare, _, _ := standalone.GetSubsidyProportions(standalone.SSVMonetarium)
+	minerFees, stakerFees := wire.CalcFeeSplitByCoinType(totalFees, work, stakeShare)
+
+	vote := wire.NewMsgTx()
+	vote.AddTxOut(&wire.TxOut{PkScript: []byte{txscript.OP_RETURN}})
+	vote.AddTxOut(&wire.TxOut{PkScript: []byte{txscript.OP_RETURN}})
+	vote.AddTxOut(&wire.TxOut{Value: 100, PkScript: stakerScript[1:]})
+	consolidation, err := stake.CreateSSFeeConsolidationOutput(stakerHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vote.AddTxOut(consolidation)
+
+	augSF := newSSFeeTestTx(augmentingSSFeeTxIn(srcSF, 1, 0), ska1,
+		stake.CreateStakerSSFeeMarker(2, 0),
+		5000+stakerFees.GetBig(ska1).Int64(), stakerScript)
+	augMF := newSSFeeTestTx(augmentingSSFeeTxIn(srcMF, 1, 1), ska1,
+		stake.CreateMinerSSFeeMarker(2),
+		3000+minerFees.GetBig(ska1).Int64(), minerScript)
+	msgBlock := &wire.MsgBlock{
+		Header:        wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2},
+		STransactions: []*wire.MsgTx{vote, augSF, augMF},
+	}
+	node := newBlockNode(&msgBlock.Header, srcNode)
+
+	err = b.validateSSFeeTxns(dcrutil.NewBlock(msgBlock), node,
+		[]*dcrutil.Tx{dcrutil.NewTx(vote)}, []*wire.MsgTx{augSF, augMF},
+		totalFees, standalone.SSVMonetarium)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestSpentSSFeeTypeSameBlock ensures spentSSFeeType finds an SSFee output
+// created earlier in the block being connected.
+func TestSpentSSFeeTypeSameBlock(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	b := newFakeChain(params)
+	const ska1 = cointype.CoinType(1)
+
+	pkScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x22}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	src := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(1),
+		3000, pkScript)
+	msgBlock := &wire.MsgBlock{
+		Header:        wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1},
+		STransactions: []*wire.MsgTx{src},
+	}
+	node := newBlockNode(&msgBlock.Header, b.bestChain.Tip())
+
+	feeType, err := b.spentSSFeeType(dcrutil.NewBlock(msgBlock), node,
+		augmentingSSFeeTxIn(src, 1, 0))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if feeType != "MF" {
+		t.Fatalf("got SSFee type %q, want MF", feeType)
+	}
+}
