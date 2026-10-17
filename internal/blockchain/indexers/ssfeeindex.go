@@ -408,8 +408,8 @@ func deserializeOutPoints(data []byte) ([]wire.OutPoint, error) {
 // This is called when a block is connected to the main chain.
 //
 // For each SSFee transaction in the block:
-//  1. Extract the consolidation address from output[0]
-//  2. Create index key: "sf" + coinType + addressHash160
+//  1. Extract the address hash160 from the payment at output[1]
+//  2. Create index key: "sf" + feeType + coinType + addressHash160
 //  3. Add the outpoint to the list for this key
 //
 // This is part of the Indexer interface implementation via ProcessNotification.
@@ -431,10 +431,10 @@ func (idx *SSFeeIndex) ConnectBlock(dbTx database.Tx, block *dcrutil.Block) erro
 
 		ssfeeCount++
 
-		// Ensure SSFee has at least 2 outputs
+		// Skip an SSFee without the payment output at index 1, since there
+		// is nothing to index.
 		if len(stx.MsgTx().TxOut) < 2 {
-			return fmt.Errorf("SSFee transaction %v has insufficient outputs (need 2, got %d)",
-				stx.Hash(), len(stx.MsgTx().TxOut))
+			continue
 		}
 
 		// SSFee standard format: output[0] = OP_RETURN marker, output[1] = payment
@@ -513,8 +513,8 @@ func (idx *SSFeeIndex) ConnectBlock(dbTx database.Tx, block *dcrutil.Block) erro
 // This is called when a block is disconnected from the main chain (reorg).
 //
 // For each SSFee transaction in the block:
-//  1. Extract the consolidation address from output[0]
-//  2. Create index key: "sf" + coinType + addressHash160
+//  1. Extract the address hash160 from the payment at output[1]
+//  2. Create index key: "sf" + feeType + coinType + addressHash160
 //  3. Remove the outpoint from the list for this key
 //
 // This is part of the Indexer interface implementation via ProcessNotification.
@@ -532,10 +532,10 @@ func (idx *SSFeeIndex) DisconnectBlock(dbTx database.Tx, block *dcrutil.Block) e
 			continue
 		}
 
-		// Ensure SSFee has at least 2 outputs
+		// Skip an SSFee without the payment output at index 1, since there
+		// is nothing to index.
 		if len(stx.MsgTx().TxOut) < 2 {
-			return fmt.Errorf("SSFee transaction %v has insufficient outputs (need 2, got %d)",
-				stx.Hash(), len(stx.MsgTx().TxOut))
+			continue
 		}
 
 		// SSFee standard format: output[0] = OP_RETURN marker, output[1] = payment
@@ -564,8 +564,6 @@ func (idx *SSFeeIndex) DisconnectBlock(dbTx database.Tx, block *dcrutil.Block) e
 		if err != nil {
 			return fmt.Errorf("failed to deserialize existing outpoints: %w", err)
 		}
-
-		_ = paymentIndex // Used for clarity, outpoint index is always 1
 
 		// Remove this outpoint from the list
 		targetHash := *stx.Hash()
@@ -622,17 +620,18 @@ func (idx *SSFeeIndex) DisconnectBlock(dbTx database.Tx, block *dcrutil.Block) e
 // The isMiner parameter specifies whether to look up miner (true) or staker (false) UTXOs.
 // Miner and staker SSFees are tracked separately to avoid collisions.
 func (idx *SSFeeIndex) LookupUTXO(isMiner bool, coinType cointype.CoinType, addressHash160 []byte) (*wire.OutPoint, *big.Int, int64, uint32, error) {
-	var outpoint *wire.OutPoint
-	var value *big.Int
-	var blockHeight int64
-	var blockIndex uint32
-
 	// Determine fee type based on caller
 	feeType := ssfeeTypeStaker
 	if isMiner {
 		feeType = ssfeeTypeMiner
 	}
 
+	// Read the candidate outpoints and close the database transaction before
+	// querying the chain. FetchUtxoEntrySKADetails takes the chain lock, while
+	// block processing holds the chain lock and waits in db.Flush for every
+	// open transaction to finish. Calling into the chain from inside db.View
+	// inverts that lock order and deadlocks the node.
+	var outpoints []wire.OutPoint
 	err := idx.db.View(func(dbTx database.Tx) error {
 		// Get the SSFee index bucket
 		bucket := dbTx.Metadata().Bucket(ssfeeIndexKey)
@@ -654,39 +653,39 @@ func (idx *SSFeeIndex) LookupUTXO(isMiner bool, coinType cointype.CoinType, addr
 			return nil
 		}
 
-		outpoints, err := deserializeOutPoints(data)
+		outpoints, err = deserializeOutPoints(data)
 		if err != nil {
 			return fmt.Errorf("failed to deserialize outpoints: %w", err)
 		}
-
-		// Query blockchain UTXO set to find an unspent output
-		// Try each outpoint until we find an unspent one
-		for _, op := range outpoints {
-			// Use SKA-specific method to get *big.Int amount directly (avoids int64 truncation)
-			amount, height, index, spent, err := idx.chain.FetchUtxoEntrySKADetails(op)
-			if err != nil {
-				continue
-			}
-
-			// Skip if UTXO doesn't exist or is spent
-			if spent || amount == nil || amount.Sign() <= 0 {
-				continue
-			}
-
-			// Found valid unspent UTXO - return it with fraud proof data
-			outpoint = &op
-			value = amount
-			blockHeight = height
-			blockIndex = index
-			log.Debugf("SSFeeIndex: Selected outpoint %v with value %v (height=%d, index=%d)",
-				op, amount, height, index)
-			return nil
-		}
-
-		// No valid UTXO found - return nil (mining will use null input)
-		log.Debugf("SSFeeIndex: No valid unspent UTXO found among %d outpoint(s)", len(outpoints))
 		return nil
 	})
+	if err != nil {
+		return nil, nil, 0, 0, err
+	}
 
-	return outpoint, value, blockHeight, blockIndex, err
+	// Query blockchain UTXO set to find an unspent output. The outpoints are
+	// a snapshot; each one is re-validated against the UTXO set here.
+	for _, op := range outpoints {
+		// Use SKA-specific method to get *big.Int amount directly (avoids int64 truncation)
+		amount, height, index, spent, err := idx.chain.FetchUtxoEntrySKADetails(op)
+		if err != nil {
+			continue
+		}
+
+		// Skip if UTXO doesn't exist or is spent
+		if spent || amount == nil || amount.Sign() <= 0 {
+			continue
+		}
+
+		// Found valid unspent UTXO - return it with fraud proof data
+		log.Debugf("SSFeeIndex: Selected outpoint %v with value %v (height=%d, index=%d)",
+			op, amount, height, index)
+		return &op, amount, height, index, nil
+	}
+
+	// No valid UTXO found - return nil (mining will use null input)
+	if len(outpoints) > 0 {
+		log.Debugf("SSFeeIndex: No valid unspent UTXO found among %d outpoint(s)", len(outpoints))
+	}
+	return nil, nil, 0, 0, nil
 }

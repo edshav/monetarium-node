@@ -7,7 +7,6 @@ package blockchain
 import (
 	"errors"
 	"math/big"
-	"strings"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/blockchain/standalone"
@@ -96,10 +95,9 @@ func TestSKACrossTypeSubsidizationPrevention(t *testing.T) {
 		t.Fatalf("Expected RuleError for cross-type subsidization, got: %T", err)
 	}
 
-	// Verify the error message mentions SKA(2) specifically
-	errStr := err.Error()
-	if !strings.Contains(errStr, "SKA(2)") || !strings.Contains(errStr, "insufficient") {
-		t.Fatalf("Expected error to mention insufficient SKA(2) inputs, got: %s", errStr)
+	// The SKA1 input does not match the coin type of the SKA2 transaction.
+	if !errors.Is(err, ErrInputCoinTypeMismatch) {
+		t.Fatalf("Expected %v, got: %v", ErrInputCoinTypeMismatch, err)
 	}
 
 	// Now test that same-type SKA transactions work correctly

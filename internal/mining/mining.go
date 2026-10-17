@@ -3043,14 +3043,16 @@ nextPriorityQueueItem:
 
 	// Distribute fees once stake validation height is reached.
 	// VAR fees are scaled by voters/TicketsPerBlock so that missing voters
-	// cause the unclaimed VAR share to burn (matches validate.go:4886-4907).
+	// cause the unclaimed VAR share to burn (matches the VAR fee scaling of
+	// the validator in blockchain checkTransactionsAndConnect for the coinbase
+	// and checkConnectBlock for SSFee transactions).
 	// SKA fees are distributed in full to the voters that actually voted.
 	// Track miner's VAR fee share for coinbase (captured early to prevent loss)
 	var minerVARFeeForCoinbase int64
 
 	if nextBlockHeight >= stakeValidationHeight {
 		// Scale VAR fees by voter participation to mirror validator's fee-burn
-		// behavior (validate.go:4886-4907). When voters < TicketsPerBlock, the
+		// behavior. When voters < TicketsPerBlock, the
 		// unclaimed VAR share is burned. SKA fees are distributed in full.
 		bigVoters := new(big.Int).SetInt64(int64(voters))
 		bigTickets := new(big.Int).SetInt64(int64(g.cfg.ChainParams.TicketsPerBlock))

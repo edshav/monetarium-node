@@ -2891,7 +2891,7 @@ func TestDualCoinTransactionValidation(t *testing.T) {
 				return tx
 			},
 			shouldPass:    false,
-			expectedError: "uses inactive SKA coin type",
+			expectedError: "spends VAR output",
 		},
 		{
 			name: "Invalid: SKA transaction with VAR inputs",
@@ -2930,7 +2930,7 @@ func TestDualCoinTransactionValidation(t *testing.T) {
 				return tx
 			},
 			shouldPass:    false,
-			expectedError: "uses inactive SKA coin type",
+			expectedError: "spends VAR output",
 		},
 	}
 

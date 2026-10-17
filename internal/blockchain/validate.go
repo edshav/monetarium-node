@@ -2435,7 +2435,11 @@ func (b *BlockChain) checkBlockContext(block *dcrutil.Block, prevNode *blockNode
 	// Pass prevNode instead of blockHeight to avoid lock re-acquisition
 	err = CheckSKAEmissionInBlock(block, prevNode, b, b.chainParams)
 	if err != nil {
-		return err
+		// Conflicts with the recorded emission state are not rule errors.
+		if isSKAEmissionStateError(err) {
+			return err
+		}
+		return ruleError(ErrInvalidSKAEmission, err.Error())
 	}
 
 	return nil
@@ -2599,7 +2603,7 @@ func (b *BlockChain) spentSSFeeType(block *dcrutil.Block, node *blockNode,
 //   - Null input: Has ValueIn set to fee amount, creates new UTXO
 //   - Real input: References existing UTXO, augments it with fee
 //
-// - Outputs: Distribution to stakers (for staker SSFee) or miner (for miner SSFee)
+// - Outputs: One payment output (to a consolidation address or the miner) plus OP_RETURN outputs
 // - OP_RETURN marker: Contains "SF" for staker fees or "MF" for miner fees
 // - Coin Type: All outputs must be the same coin type
 //
@@ -2607,7 +2611,9 @@ func (b *BlockChain) spentSSFeeType(block *dcrutil.Block, node *blockNode,
 // - Each SSFee tx distributes fees for exactly one coin type
 // - For null input SSFee: output value == expected fee
 // - For augmented SSFee: output value == input value + expected fee
+// - Each SSFee pays a single output that is not OP_RETURN
 // - Staker SSFee (SF) can distribute any coin type including VAR
+// - Staker SSFee (SF) pays the consolidation script of a voter
 // - Miner SSFee (MF) distributes non-VAR only (VAR miner fees go to coinbase)
 // - All coin types with staker fees have corresponding SSFee transactions
 // - All non-VAR coin types with miner fees have corresponding SSFee transactions
@@ -2738,15 +2744,22 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			return ruleError(ErrStakeFees, err.Error())
 		}
 
-		// Get the coin type from the first non-OP_RETURN output
+		// An SSFee pays a single output, which is not OP_RETURN, and takes
+		// its coin type from it.
 		var coinType cointype.CoinType
+		var numPayments int
 		for _, out := range ssFeeTx.TxOut {
 			// Skip OP_RETURN outputs
 			if len(out.PkScript) > 0 && out.PkScript[0] == txscript.OP_RETURN {
 				continue
 			}
 			coinType = out.CoinType
-			break
+			numPayments++
+		}
+		if numPayments != 1 {
+			return ruleError(ErrStakeFees,
+				fmt.Sprintf("SSFee transaction has %d payment outputs, "+
+					"expected 1", numPayments))
 		}
 
 		// Determine if this is null-input (creating new) or augmented (reusing UTXO)
@@ -2866,8 +2879,8 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			// NOTE: With batched consolidation, we create ONE SSFee per unique consolidation
 			// address per coin type. Multiple voters with same address share one SSFee.
 
-			// Extract recipient hash160 from first payment output
-			// SKA uses bigint for totals, VAR uses int64
+			// Extract recipient hash160 from the payment output
+			// SKA uses bigint, VAR uses int64
 			var recipientHash160 []byte
 			var totalOutputValue int64
 			var totalOutputValueSKA *big.Int
@@ -2881,14 +2894,19 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 					continue
 				}
 
-				// Extract hash160 from payment output for consolidation address verification
-				if recipientHash160 == nil {
-					var err error
-					recipientHash160, err = extractHash160FromPkScript(out.PkScript)
-					if err != nil {
-						return ruleError(ErrStakeFees,
-							fmt.Sprintf("invalid SSFee payment script: %v", err))
-					}
+				recipientHash160, err = extractHash160FromPkScript(out.PkScript)
+				if err != nil {
+					return ruleError(ErrStakeFees,
+						fmt.Sprintf("invalid SSFee payment script: %v", err))
+				}
+
+				// The payment must use the consolidation script of its
+				// recipient.  The hash160 is 20 bytes, so this cannot fail.
+				payScript, _ := stake.ConsolidationAddrToPkScript(recipientHash160)
+				if out.Version != 0 || !bytes.Equal(out.PkScript, payScript) {
+					return ruleError(ErrStakeFees,
+						fmt.Sprintf("staker SSFee payment script is not the "+
+							"consolidation script of %x", recipientHash160))
 				}
 
 				// Get the output value based on coin type
@@ -2915,19 +2933,17 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			}
 
 			// Verify recipient matches at least one voter's consolidation address
-			if recipientHash160 != nil {
-				validRecipient := false
-				for _, voterHash160 := range voterConsolidation {
-					if bytes.Equal(recipientHash160, voterHash160) {
-						validRecipient = true
-						break
-					}
+			validRecipient := false
+			for _, voterHash160 := range voterConsolidation {
+				if bytes.Equal(recipientHash160, voterHash160) {
+					validRecipient = true
+					break
 				}
-				if !validRecipient {
-					return ruleError(ErrStakeFees,
-						fmt.Sprintf("SSFee recipient %x does not match any voter consolidation address",
-							recipientHash160))
-				}
+			}
+			if !validRecipient {
+				return ruleError(ErrStakeFees,
+					fmt.Sprintf("SSFee recipient %x does not match any voter consolidation address",
+						recipientHash160))
 			}
 
 			// Calculate the fee distributed by this SSFee transaction
@@ -2981,20 +2997,18 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			}
 
 			// Track per-consolidation-address distribution for detailed validation
-			if recipientHash160 != nil {
-				distKey := makeDistributionKey(coinType, hex.EncodeToString(recipientHash160))
-				if coinType.IsSKA() {
-					// Track SKA distribution using bigint
-					existing := actualDistributionSKA[distKey]
-					if existing == nil {
-						actualDistributionSKA[distKey] = new(big.Int).Set(thisFeeSKA)
-					} else {
-						actualDistributionSKA[distKey] = new(big.Int).Add(existing, thisFeeSKA)
-					}
+			distKey := makeDistributionKey(coinType, hex.EncodeToString(recipientHash160))
+			if coinType.IsSKA() {
+				// Track SKA distribution using bigint
+				existing := actualDistributionSKA[distKey]
+				if existing == nil {
+					actualDistributionSKA[distKey] = new(big.Int).Set(thisFeeSKA)
 				} else {
-					// Track VAR distribution using int64
-					actualDistribution[distKey] = addInt64Safe(actualDistribution[distKey], thisFee)
+					actualDistributionSKA[distKey] = new(big.Int).Add(existing, thisFeeSKA)
 				}
+			} else {
+				// Track VAR distribution using int64
+				actualDistribution[distKey] = addInt64Safe(actualDistribution[distKey], thisFee)
 			}
 		}
 
@@ -4022,7 +4036,8 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 	// Only null-input SSFee transactions bypass input validation here.
 	// Augmented SSFee (real input) must have its inputs validated.
 	// All SSFee are validated through validateSSFeeTxns for fee distribution.
-	isSSFee := stake.DetermineTxType(msgTx) == stake.TxTypeSSFee
+	txType := stake.DetermineTxType(msgTx)
+	isSSFee := txType == stake.TxTypeSSFee
 	if isSSFee {
 		if len(msgTx.TxIn) > 0 && msgTx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
 			return big.NewInt(0), nil // Null-input SSFee - no inputs to validate
@@ -4115,8 +4130,11 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 	// Decred general transaction testing (and a few stake exceptions).
 	// -------------------------------------------------------------------
 
+	isStakeTx := txType != stake.TxTypeRegular
+
 	txHash := tx.Hash()
 	var totalAtomIn int64
+	txCoinType := wire.GetPrimaryCoinType(msgTx)
 	for idx, txIn := range msgTx.TxIn {
 		// Inputs won't exist for stakebase tx, so ignore them.
 		if isVote && idx == 0 {
@@ -4146,6 +4164,15 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 			return big.NewInt(0), ruleError(ErrMissingTxOut, str)
 		}
 
+		// Stake transactions are never allowed to spend transactions from the
+		// regular or stake tree of the same block.
+		if isStakeTx && utxoEntry.BlockHeight() == txHeight {
+			str := fmt.Sprintf("stake transaction input %s:%d tried to spend "+
+				"output %v at same height %d", txHash, idx, txInOutpoint,
+				txHeight)
+			return big.NewInt(0), ruleError(ErrMissingTxOut, str)
+		}
+
 		// Check fraud proof witness data.
 
 		// Using zero value outputs as inputs is banned.
@@ -4164,32 +4191,28 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 		}
 
 		if checkFraudProof {
-			// Fraud proof value check - SKA and VAR use different fields
-			if utxoEntry.CoinType().IsSKA() {
-				// SKA: compare SKAValueIn (bigint) vs SKAAmount (bigint)
-				// Regular ValueIn/Amount should be 0 for SKA
-				expectedSKA := utxoEntry.SKAAmount()
-				givenSKA := txIn.SKAValueIn
-				if expectedSKA == nil {
-					expectedSKA = new(big.Int)
-				}
-				if givenSKA == nil {
-					givenSKA = new(big.Int)
-				}
-				if expectedSKA.Cmp(givenSKA) != 0 {
-					str := fmt.Sprintf("bad fraud check SKA value in "+
-						"(expected %v, given %v) for txIn %v",
-						expectedSKA, givenSKA, idx)
-					return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
-				}
-			} else {
-				// VAR: compare ValueIn (int64) vs Amount (int64)
-				if txIn.ValueIn != utxoEntry.Amount() {
-					str := fmt.Sprintf("bad fraud check value in "+
-						"(expected %v, given %v) for txIn %v",
-						utxoEntry.Amount(), txIn.ValueIn, idx)
-					return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
-				}
+			// Both value fields must match the output being spent.  An SKA
+			// output has a zero atom amount and a VAR output has no SKA
+			// amount, so the field of the other coin type must be zero.
+			if txIn.ValueIn != utxoEntry.Amount() {
+				str := fmt.Sprintf("bad fraud check value in "+
+					"(expected %v, given %v) for txIn %v",
+					utxoEntry.Amount(), txIn.ValueIn, idx)
+				return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
+			}
+			expectedSKA := utxoEntry.SKAAmount()
+			givenSKA := txIn.SKAValueIn
+			if expectedSKA == nil {
+				expectedSKA = new(big.Int)
+			}
+			if givenSKA == nil {
+				givenSKA = new(big.Int)
+			}
+			if expectedSKA.Cmp(givenSKA) != 0 {
+				str := fmt.Sprintf("bad fraud check SKA value in "+
+					"(expected %v, given %v) for txIn %v",
+					expectedSKA, givenSKA, idx)
+				return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
 			}
 
 			if int64(txIn.BlockHeight) != utxoEntry.BlockHeight() {
@@ -4207,6 +4230,15 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 					txIn.BlockIndex, idx)
 				return big.NewInt(0), ruleError(ErrFraudBlockIndex, str)
 			}
+		}
+
+		// Transactions are single-coin, so every input must spend an output
+		// of the coin type of the transaction.
+		if utxoEntry.CoinType() != txCoinType {
+			str := fmt.Sprintf("transaction %v input %d spends %v output %v "+
+				"in a %v transaction", txHash, idx, utxoEntry.CoinType(),
+				txInOutpoint, txCoinType)
+			return big.NewInt(0), ruleError(ErrInputCoinTypeMismatch, str)
 		}
 
 		// Ensure the transaction is not spending coins which have not
@@ -4902,11 +4934,13 @@ func getStakeTreeFees(subsidyCache *standalone.SubsidyCache, height int64,
 // checkTransactionsAndConnect is the local function used to check the
 // transaction inputs for a transaction list given a predetermined utxo view.
 // After ensuring the transaction is valid, the transaction is connected to the
-// utxo view.
+// utxo view.  The fees the SSFee transactions of the block distribute are added
+// to distributedFees.
 func (b *BlockChain) checkTransactionsAndConnect(inputFees dcrutil.Amount,
 	node *blockNode, txs []*dcrutil.Tx, view *UtxoViewpoint,
 	stxos *[]spentTxOut, stakeTree bool,
-	subsidySplitVariant standalone.SubsidySplitVariant) error {
+	subsidySplitVariant standalone.SubsidySplitVariant,
+	distributedFees wire.FeesByType) error {
 
 	isTreasuryEnabled, err := b.isTreasuryAgendaActive(node.parent)
 	if err != nil {
@@ -4969,6 +5003,19 @@ func (b *BlockChain) checkTransactionsAndConnect(inputFees dcrutil.Amount,
 		// Sum the total fees by coin type using big.Int (no overflow possible)
 		coinType := wire.GetPrimaryCoinType(tx.MsgTx())
 		totalFees.AddBig(coinType, txFee)
+
+		// Votes, treasurybases, treasury spends and SSFee transactions pay no
+		// fee that SSFee transactions distribute.
+		txType := stake.TxTypeRegular
+		if stakeTree {
+			txType = stake.DetermineTxType(tx.MsgTx())
+		}
+		switch txType {
+		case stake.TxTypeSSGen, stake.TxTypeTreasuryBase, stake.TxTypeTSpend,
+			stake.TxTypeSSFee:
+		default:
+			distributedFees.AddBig(coinType, txFee)
+		}
 
 		// Update the view to mark all utxos spent by the transaction as spent
 		// and add all of the outputs for this transaction which are not
@@ -5423,9 +5470,12 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 	// to use the Monetarium split for production
 	subsidySplitVariant := standalone.SSVMonetarium
 
+	// Fees of both trees that the SSFee transactions of the block distribute.
+	distributedFees := wire.NewFeesByType()
+
 	const stakeTreeTrue = true
 	err = b.checkTransactionsAndConnect(0, node, block.STransactions(),
-		view, stxos, stakeTreeTrue, subsidySplitVariant)
+		view, stxos, stakeTreeTrue, subsidySplitVariant, distributedFees)
 	if err != nil {
 		log.Tracef("checkTransactionsAndConnect failed for stake tree: %v", err)
 		return err
@@ -5489,7 +5539,8 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 	// First, validate regular transactions (this detects double spends before SSFee validation)
 	const stakeTreeFalse = false
 	err = b.checkTransactionsAndConnect(stakeTreeFees, node,
-		block.Transactions(), view, stxos, stakeTreeFalse, subsidySplitVariant)
+		block.Transactions(), view, stxos, stakeTreeFalse, subsidySplitVariant,
+		distributedFees)
 	if err != nil {
 		log.Tracef("checkTransactionsAndConnect failed for regular tree: %v",
 			err)
@@ -5499,36 +5550,6 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 	// Now validate SSFee transactions AFTER double-spend detection.
 	// This ensures we don't report SSFee mismatches for invalid blocks.
 	if node.height >= b.chainParams.StakeValidationHeight {
-		// Calculate total fees from regular tree using ValueIn (always available).
-		// We use ValueIn/SKAValueIn instead of looking up UTXOs because
-		// checkTransactionsAndConnect has already marked some UTXOs as spent.
-		// CalcTxFee handles both VAR and SKA transactions correctly.
-		totalFees := wire.NewFeesByType()
-		for _, tx := range block.Transactions()[1:] { // Skip coinbase
-			txFee, coinType := wire.CalcTxFee(tx.MsgTx())
-			if txFee.Sign() > 0 {
-				totalFees.AddBig(coinType, txFee)
-			}
-		}
-
-		// ALSO calculate fees from stake tree (ticket purchases pay fees!)
-		for _, stx := range block.STransactions() {
-			// Skip special stake transactions that don't pay fees
-			txType := stake.DetermineTxType(stx.MsgTx())
-			if txType == stake.TxTypeSSGen || // Votes don't pay fees
-				txType == stake.TxTypeTreasuryBase ||
-				txType == stake.TxTypeTSpend ||
-				txType == stake.TxTypeSSFee { // SSFee doesn't pay fees
-				continue
-			}
-
-			// Calculate fee for this stake transaction (e.g., ticket purchase)
-			txFee, coinType := wire.CalcTxFee(stx.MsgTx())
-			if txFee.Sign() > 0 {
-				totalFees.AddBig(coinType, txFee)
-			}
-		}
-
 		// Scale VAR fees by voter participation using big.Int to avoid overflow.
 		// SKA fees are NOT scaled - they are always distributed in full (50% miner, 50% stakers).
 		// This means SKA stakers benefit when fewer tickets vote (larger share each),
@@ -5537,7 +5558,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 		bigVoters := new(big.Int).SetInt64(int64(node.voters))
 		bigTickets := new(big.Int).SetInt64(int64(b.chainParams.TicketsPerBlock))
 
-		for coinType, fee := range totalFees {
+		for coinType, fee := range distributedFees {
 			if fee == nil || fee.Sign() <= 0 {
 				continue
 			}
@@ -5548,7 +5569,7 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 			// (fee * voters) / ticketsPerBlock
 			scaledBig := new(big.Int).Mul(fee, bigVoters)
 			scaledBig.Div(scaledBig, bigTickets)
-			totalFees[coinType] = scaledBig
+			distributedFees[coinType] = scaledBig
 		}
 
 		// Get SSFee transactions and votes from the stake tree
@@ -5566,8 +5587,8 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 		// Validate SSFee transactions if any exist
 		if len(ssFeeTxns) > 0 {
 			log.Infof("Validating %d SSFee transaction(s) for block height %d with total fees %v (voters=%d)",
-				len(ssFeeTxns), node.height, totalFees, node.voters)
-			err = b.validateSSFeeTxns(block, node, votes, ssFeeTxns, totalFees, subsidySplitVariant)
+				len(ssFeeTxns), node.height, distributedFees, node.voters)
+			err = b.validateSSFeeTxns(block, node, votes, ssFeeTxns, distributedFees, subsidySplitVariant)
 			if err != nil {
 				return err
 			}

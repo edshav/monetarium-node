@@ -3105,6 +3105,7 @@ func TestFraudProofHandling(t *testing.T) {
 		incorrectTxInAmount      bool
 		incorrectTxInBlockHeight bool
 		incorrectTxInBlockIndex  bool
+		incorrectTxInSKAValue    bool
 	}{{
 		name:                     "correct fraud proof",
 		incorrectTxInAmount:      false,
@@ -3145,6 +3146,9 @@ func TestFraudProofHandling(t *testing.T) {
 		incorrectTxInAmount:      true,
 		incorrectTxInBlockHeight: true,
 		incorrectTxInBlockIndex:  true,
+	}, {
+		name:                  "SKA amount on a VAR input",
+		incorrectTxInSKAValue: true,
 	}}
 
 	for _, test := range tests {
@@ -3196,6 +3200,9 @@ func TestFraudProofHandling(t *testing.T) {
 		if test.incorrectTxInBlockIndex {
 			txIn.BlockIndex++
 		}
+		if test.incorrectTxInSKAValue {
+			txIn.SKAValueIn = big.NewInt(1)
+		}
 
 		// Ensure the regular tx is accepted.
 		_, err = harness.txPool.ProcessTransaction(tx, false, true, 0)
@@ -3229,6 +3236,12 @@ func TestFraudProofHandling(t *testing.T) {
 		if int64(txInFromMempool.BlockIndex) != int64(utxoBlockIndex) {
 			t.Errorf("%q: unexpected block index -- got %v, want %v", test.name,
 				txInFromMempool.BlockIndex, utxoBlockIndex)
+		}
+
+		// Validate that the transaction input has no SKA amount.
+		if txInFromMempool.SKAValueIn != nil {
+			t.Errorf("%q: unexpected SKA amount -- got %v, want none",
+				test.name, txInFromMempool.SKAValueIn)
 		}
 	}
 }

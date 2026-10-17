@@ -60,6 +60,23 @@ func (view *UtxoViewpoint) RemoveEntry(outpoint wire.OutPoint) {
 	delete(view.entries, outpoint)
 }
 
+// isProvablyUnspendable returns whether the passed output is provably
+// unspendable and therefore never part of the utxo set.
+func isProvablyUnspendable(txOut *wire.TxOut) bool {
+	// For SKA outputs, Value=0 but SKAValue contains the actual amount,
+	// so check SKAValue before calling IsUnspendable.
+	if txOut.CoinType.IsSKA() {
+		// SKA outputs are unspendable only if SKAValue is nil/zero or script is bad
+		if txOut.SKAValue == nil || txOut.SKAValue.Sign() == 0 {
+			return true
+		}
+		// Check script validity for SKA
+		return len(txOut.PkScript) > txscript.MaxScriptSize ||
+			(len(txOut.PkScript) > 0 && txOut.PkScript[0] == txscript.OP_RETURN)
+	}
+	return txscript.IsUnspendable(txOut.Value, txOut.PkScript)
+}
+
 // addTxOut adds the specified output to the view if it is not provably
 // unspendable.  When the view already has an entry for the output, it will be
 // marked unspent.  All fields will be updated for existing entries since it's
@@ -69,19 +86,7 @@ func (view *UtxoViewpoint) addTxOut(outpoint wire.OutPoint, txOut *wire.TxOut,
 	ticketMinOuts *ticketMinimalOutputs) {
 
 	// Don't add provably unspendable outputs.
-	// For SKA outputs, Value=0 but SKAValue contains the actual amount,
-	// so check SKAValue before calling IsUnspendable.
-	if txOut.CoinType.IsSKA() {
-		// SKA outputs are unspendable only if SKAValue is nil/zero or script is bad
-		if txOut.SKAValue == nil || txOut.SKAValue.Sign() == 0 {
-			return
-		}
-		// Check script validity for SKA
-		if len(txOut.PkScript) > txscript.MaxScriptSize ||
-			(len(txOut.PkScript) > 0 && txOut.PkScript[0] == txscript.OP_RETURN) {
-			return
-		}
-	} else if txscript.IsUnspendable(txOut.Value, txOut.PkScript) {
+	if isProvablyUnspendable(txOut) {
 		return
 	}
 
@@ -537,7 +542,7 @@ func (view *UtxoViewpoint) disconnectTransactions(block *dcrutil.Block,
 		outpoint := wire.OutPoint{Hash: *txHash, Tree: tree}
 		for txOutIdx, txOut := range msgTx.TxOut {
 			// Don't add provably unspendable outputs.
-			if txscript.IsUnspendable(txOut.Value, txOut.PkScript) {
+			if isProvablyUnspendable(txOut) {
 				continue
 			}
 
@@ -944,9 +949,9 @@ func (view *UtxoViewpoint) addRegularInputUtxos(block *dcrutil.Block,
 			// It is acceptable for a transaction input in the regular tree to
 			// reference the output of another transaction in the regular tree
 			// of this block only if the referenced transaction comes before the
-			// current one in this block.  Add the outputs of the referenced
-			// transaction as available utxos when this is the case.  Otherwise,
-			// the utxo details are still needed.
+			// current one in this block.  Add the output of the referenced
+			// transaction as an available utxo when this is the case.
+			// Otherwise, the utxo details are still needed.
 			//
 			// NOTE: The >= is correct here because i is one less than the
 			// actual position of the transaction within the block due to
@@ -956,8 +961,9 @@ func (view *UtxoViewpoint) addRegularInputUtxos(block *dcrutil.Block,
 				i >= inFlightIndex {
 
 				originTx := regularTxns[inFlightIndex]
-				view.AddTxOuts(originTx, block.Height(), uint32(inFlightIndex),
-					isTreasuryEnabled)
+				originIdx := txIn.PreviousOutPoint.Index
+				view.AddTxOut(originTx, originIdx, block.Height(),
+					uint32(inFlightIndex), isTreasuryEnabled)
 				continue
 			}
 

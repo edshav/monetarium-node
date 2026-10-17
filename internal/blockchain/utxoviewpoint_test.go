@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/monetarium/monetarium-node/blockchain/chaingen"
+	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrutil"
@@ -383,5 +384,125 @@ func TestUtxoViewpointCoinTypeTracking(t *testing.T) {
 	unknownCount := view.GetCoinTypeCount(cointype.CoinType(99))
 	if unknownCount != 0 {
 		t.Errorf("Expected 0 count for unknown coin type, got %d", unknownCount)
+	}
+}
+
+// TestSameBlockStakeSpend ensures stake transactions, including augmented SSFee
+// transactions which are exempt from the stake output maturity rules, are never
+// able to spend outputs created in the same block, while regular transactions
+// still are.
+func TestSameBlockStakeSpend(t *testing.T) {
+	// Create a test harness initialized with the genesis block as the tip.
+	params := chaincfg.RegNetParams()
+	g := newChaingenHarness(t, params)
+	g.AdvanceToStakeValidationHeight()
+
+	// sameBlockSpend returns a munger that adds a transaction to the regular
+	// tree followed by a regular transaction that spends its first output and,
+	// when provided, invokes the given func to add a stake transaction that
+	// spends the same output.  The transactions pay no fee so the generator
+	// does not regenerate the SSFee transactions.
+	outs := g.OldestCoinbaseOuts()
+	sameBlockSpend := func(addStakeSpend func(b *wire.MsgBlock,
+		originTx *wire.MsgTx, originIdx uint32)) func(*wire.MsgBlock) {
+
+		return func(b *wire.MsgBlock) {
+			originTx := g.CreateSpendTx(&outs[0], 0)
+			b.AddTransaction(originTx)
+			originIdx := uint32(len(b.Transactions) - 1)
+			b.AddTransaction(g.CreateSpendTxForTx(originTx, b.Header.Height,
+				originIdx, 0))
+			if addStakeSpend != nil {
+				addStakeSpend(b, originTx, originIdx)
+			}
+		}
+	}
+
+	// Ensure a ticket spending a same-block output that a regular transaction
+	// also spends is rejected since it would otherwise be a double spend.
+	//
+	//   ... -> bsvh
+	//             \-> bss0
+	baseName := g.TipName()
+	g.NextBlock("bss0", nil, outs[1:], sameBlockSpend(func(b *wire.MsgBlock,
+		originTx *wire.MsgTx, originIdx uint32) {
+
+		spend := chaingen.MakeSpendableOutForTx(originTx, b.Header.Height,
+			originIdx, 0)
+		ticketPrice := dcrutil.Amount(g.CalcNextRequiredStakeDifficulty())
+		b.AddSTransaction(g.CreateTicketPurchaseTx(&spend, ticketPrice, 0))
+		b.Header.FreshStake++
+	}))
+	g.RejectTipBlock(ErrMissingTxOut)
+
+	// Ensure an augmented SSFee spending the payout of an SSFee earlier in the
+	// same block is rejected as well.  An augmented SSFee may only spend an
+	// SSFee output, so that is the only same-block output it could spend.
+	//
+	//   ... -> bsvh
+	//             \-> bss1
+	g.SetTip(baseName)
+	g.NextBlock("bss1", nil, outs[1:], func(b *wire.MsgBlock) {
+		for i, stx := range b.STransactions {
+			if stake.DetermineTxType(stx) != stake.TxTypeSSFee {
+				continue
+			}
+			const paymentIdx = 0
+			amount := stx.TxOut[paymentIdx].Value
+			augmented := stx.Copy()
+			augmented.TxIn[0] = &wire.TxIn{
+				PreviousOutPoint: wire.OutPoint{Hash: stx.TxHash(),
+					Index: paymentIdx, Tree: wire.TxTreeStake},
+				Sequence:    wire.MaxTxInSequenceNum,
+				ValueIn:     amount,
+				BlockHeight: b.Header.Height,
+				BlockIndex:  uint32(i),
+			}
+			augmented.TxOut[paymentIdx].Value += amount
+			b.AddSTransaction(augmented)
+			return
+		}
+		t.Fatal("block template has no SSFee transaction to augment")
+	})
+	g.RejectTipBlock(ErrMissingTxOut)
+
+	// Ensure regular transactions are still allowed to spend outputs of an
+	// earlier transaction in the same block.
+	//
+	//   ... -> bsvh -> bss2
+	g.SetTip(baseName)
+	g.NextBlock("bss2", nil, outs[1:], sameBlockSpend(nil))
+	g.AcceptTipBlock()
+}
+
+// TestAddRegularInputUtxosOnlyReferenced ensures that only the outputs of
+// in-flight regular transactions that are actually referenced by later regular
+// transactions in the same block are added to the view.
+func TestAddRegularInputUtxosOnlyReferenced(t *testing.T) {
+	origin := wire.NewMsgTx()
+	origin.AddTxOut(wire.NewTxOut(10, []byte{0x51}))
+	origin.AddTxOut(wire.NewTxOut(20, []byte{0x51}))
+	originHash := origin.TxHash()
+	spender := wire.NewMsgTx()
+	spender.AddTxIn(&wire.TxIn{PreviousOutPoint: wire.OutPoint{
+		Hash:  originHash,
+		Index: 1,
+	}})
+	block := dcrutil.NewBlock(&wire.MsgBlock{
+		Header:       wire.BlockHeader{Height: 100},
+		Transactions: []*wire.MsgTx{wire.NewMsgTx(), origin, spender},
+	})
+
+	view := NewUtxoViewpoint(nil)
+	view.addRegularInputUtxos(block, true)
+
+	referenced := wire.OutPoint{Hash: originHash, Index: 1}
+	if entry := view.LookupEntry(referenced); entry == nil || entry.IsSpent() {
+		t.Fatalf("referenced in-flight output %v not available in view",
+			referenced)
+	}
+	unreferenced := wire.OutPoint{Hash: originHash, Index: 0}
+	if entry := view.LookupEntry(unreferenced); entry != nil {
+		t.Fatalf("unreferenced in-flight output %v added to view", unreferenced)
 	}
 }
