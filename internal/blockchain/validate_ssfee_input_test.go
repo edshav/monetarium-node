@@ -15,6 +15,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg"
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
+	"github.com/monetarium/monetarium-node/database"
 	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/wire"
@@ -210,10 +211,14 @@ func TestCheckTransactionInputsRejectsInvalidAugmentedSSFee(t *testing.T) {
 			want: ErrMissingTxOut,
 		},
 		{
+			// An untagged output has no maturity rule, so only the check of
+			// the transaction that created it rejects the spend.
 			name: "spends a non-SSFee output",
-			mutate: func(prev *ssFeeTestOutput, _ *wire.MsgTx) {
+			mutate: func(prev *ssFeeTestOutput, tx *wire.MsgTx) {
 				prev.entry.packedFlags = encodeUtxoFlags(false, false,
 					stake.TxTypeRegular)
+				prev.entry.pkScript = ssFeeScript[1:]
+				tx.TxOut[1].PkScript = ssFeeScript[1:]
 			},
 			want: ErrBadSSFeeInput,
 		},
@@ -256,6 +261,13 @@ func TestCheckTransactionInputsRejectsInvalidAugmentedSSFee(t *testing.T) {
 			name: "second payment output pays to a different script",
 			mutate: func(_ *ssFeeTestOutput, tx *wire.MsgTx) {
 				tx.AddTxOut(newTestTxOut(cointype.CoinTypeVAR, 100, otherScript))
+			},
+			want: ErrBadSSFeeInput,
+		},
+		{
+			name: "second payment output pays to an empty script",
+			mutate: func(_ *ssFeeTestOutput, tx *wire.MsgTx) {
+				tx.AddTxOut(newTestTxOut(cointype.CoinTypeVAR, 100, nil))
 			},
 			want: ErrBadSSFeeInput,
 		},
@@ -515,7 +527,8 @@ func TestValidateSSFeeTxnsAugmentedSameType(t *testing.T) {
 
 // TestValidateSSFeeTxnsRejectsMismatchedType ensures validateSSFeeTxns rejects
 // an SSFee transaction that augments an output of an SSFee transaction of the
-// other type, in both directions.
+// other type, in both directions, whether that transaction is in the parent
+// block or earlier in the same block.
 func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 	params := chaincfg.SimNetParams()
 	b := newFakeChain(params)
@@ -557,7 +570,12 @@ func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 	stakerFee := stakerFees.GetBig(ska1).Int64()
 
 	// Each block holds one SSFee that augments an output of the other type
-	// and one valid null-input SSFee.
+	// and one valid null-input SSFee, which in the same-block cases is the
+	// SSFee whose output is augmented.
+	sameBlockSF := newNullInputSSFeeTestTx(ska1,
+		stake.CreateStakerSSFeeMarker(2, 0), stakerFee, payScript)
+	sameBlockMF := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(2),
+		minerFee, payScript)
 	tests := []struct {
 		name      string
 		ssFeeTxns []*wire.MsgTx
@@ -576,6 +594,20 @@ func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 				stake.CreateStakerSSFeeMarker(2, 0), 3000+stakerFee, payScript),
 			newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(2),
 				minerFee, payScript),
+		},
+	}, {
+		name: "miner SSFee spends a staker SSFee output in the same block",
+		ssFeeTxns: []*wire.MsgTx{
+			sameBlockSF,
+			newSSFeeTestTx(augmentingSSFeeTxIn(sameBlockSF, 2, 1), ska1,
+				stake.CreateMinerSSFeeMarker(2), stakerFee+minerFee, payScript),
+		},
+	}, {
+		name: "staker SSFee spends a miner SSFee output in the same block",
+		ssFeeTxns: []*wire.MsgTx{
+			sameBlockMF,
+			newSSFeeTestTx(augmentingSSFeeTxIn(sameBlockMF, 2, 1), ska1,
+				stake.CreateStakerSSFeeMarker(2, 0), minerFee+stakerFee, payScript),
 		},
 	}}
 	for _, test := range tests {
@@ -679,5 +711,42 @@ func TestSpentSSFeeTypeRejectsInvalidReference(t *testing.T) {
 				t.Fatalf("got error %v, want AssertError", err)
 			}
 		})
+	}
+}
+
+// TestSpentSSFeeTypeFetchError ensures spentSSFeeType returns the error of a
+// failed block fetch as is, not as a rule error, so a database fault does not
+// mark the block being connected invalid.
+func TestSpentSSFeeTypeFetchError(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	b, err := chainSetup(t, params)
+	if err != nil {
+		t.Fatalf("failed to setup chain instance: %v", err)
+	}
+	const ska1 = cointype.CoinType(1)
+
+	pkScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x22}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent block is neither cached nor stored in the database.
+	src := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(1),
+		3000, pkScript)
+	srcHeader := wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1}
+	srcNode := newBlockNode(&srcHeader, b.bestChain.Tip())
+	msgBlock := &wire.MsgBlock{
+		Header: wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2},
+	}
+	node := newBlockNode(&msgBlock.Header, srcNode)
+
+	_, err = b.spentSSFeeType(dcrutil.NewBlock(msgBlock), node,
+		augmentingSSFeeTxIn(src, 1, 0))
+	if !errors.Is(err, database.ErrBlockNotFound) {
+		t.Fatalf("got error %v, want database.ErrBlockNotFound", err)
+	}
+	var rerr RuleError
+	if errors.As(err, &rerr) {
+		t.Fatalf("got rule error %v, want the fetch error", err)
 	}
 }
