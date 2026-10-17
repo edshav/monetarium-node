@@ -900,14 +900,14 @@ func createSSFeeTxBatched(coinType cointype.CoinType, totalFee *big.Int,
 						isSpent = false
 					}
 				} else {
-					// No way to verify - assume available (legacy behavior)
-					isSpent = false
+					// No way to verify - treat the UTXO as unavailable
+					isSpent = true
 				}
 
 				if isSpent {
 					log.Debugf("SSFee UTXO %v is spent - creating new UTXO instead", outpoint)
-				} else if entry != nil && (entry.ScriptVersion() != 0 ||
-					!bytes.Equal(entry.PkScript(), recipientPkScript)) {
+				} else if entry.ScriptVersion() != 0 ||
+					!bytes.Equal(entry.PkScript(), recipientPkScript) {
 
 					// Consensus only lets an augmented SSFee pay back to the
 					// script of the output it spends.
@@ -1120,14 +1120,14 @@ func createMinerSSFeeTx(coinType cointype.CoinType, totalFee *big.Int,
 					isSpent = false
 				}
 			} else {
-				// No way to verify - assume available (legacy behavior)
-				isSpent = false
+				// No way to verify - treat the UTXO as unavailable
+				isSpent = true
 			}
 
 			if isSpent {
 				log.Debugf("Miner SSFee UTXO %v is spent - creating new UTXO instead", outpoint)
-			} else if entry != nil && (entry.ScriptVersion() != scriptVersion ||
-				!bytes.Equal(entry.PkScript(), payScript)) {
+			} else if entry.ScriptVersion() != scriptVersion ||
+				!bytes.Equal(entry.PkScript(), payScript) {
 
 				// Consensus only lets an augmented SSFee pay back to the
 				// script of the output it spends.
