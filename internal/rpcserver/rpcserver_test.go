@@ -139,6 +139,46 @@ func TestCheckAuth(t *testing.T) {
 	}
 }
 
+// TestAuth_Header_LimitedOnly validates the header authentication when only
+// limited credentials are configured.
+func TestAuth_Header_LimitedOnly(t *testing.T) {
+	s, err := New(&Config{
+		RPCLimitUser: "limit",
+		RPCLimitPass: "limit",
+	})
+	if err != nil {
+		t.Fatalf("unable to create RPC server: %v", err)
+	}
+
+	// Reject requests with no auth.
+	authed, isAdmin, err := s.checkAuth(&http.Request{}, true)
+	if authed {
+		t.Errorf("unexpected authed -- got %v, want %v", authed, false)
+	}
+	if isAdmin {
+		t.Errorf("unexpected isAdmin -- got %v, want %v", isAdmin, false)
+	}
+	if err == nil {
+		t.Errorf("unexpected err -- got %v, want auth failure", err)
+	}
+
+	// Accept request with correct auth, ensure not admin.
+	r := &http.Request{Header: make(map[string][]string, 1)}
+	r.Header["Authorization"] = []string{
+		"Basic bGltaXQ6bGltaXQ=", // limit:limit
+	}
+	authed, isAdmin, err = s.checkAuth(r, true)
+	if !authed {
+		t.Errorf("unexpected authed -- got %v, want %v", authed, true)
+	}
+	if isAdmin {
+		t.Errorf("unexpected isAdmin -- got %v, want %v", isAdmin, false)
+	}
+	if err != nil {
+		t.Errorf("unexpected err -- got %v, want %v", err, nil)
+	}
+}
+
 // TestLimitedMethodsExist ensures all RPC methods listed in the limited RPC
 // methods map have associated handlers defined.
 func TestLimitedMethodsExist(t *testing.T) {
