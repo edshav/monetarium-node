@@ -3901,7 +3901,8 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 	// Only null-input SSFee transactions bypass input validation here.
 	// Augmented SSFee (real input) must have its inputs validated.
 	// All SSFee are validated through validateSSFeeTxns for fee distribution.
-	if stake.DetermineTxType(msgTx) == stake.TxTypeSSFee {
+	txType := stake.DetermineTxType(msgTx)
+	if txType == stake.TxTypeSSFee {
 		if len(msgTx.TxIn) > 0 && msgTx.TxIn[0].PreviousOutPoint.Index == wire.MaxPrevOutIndex {
 			return big.NewInt(0), nil // Null-input SSFee - no inputs to validate
 		}
@@ -3989,6 +3990,8 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 	// Decred general transaction testing (and a few stake exceptions).
 	// -------------------------------------------------------------------
 
+	isStakeTx := txType != stake.TxTypeRegular
+
 	txHash := tx.Hash()
 	var totalAtomIn int64
 	txCoinType := wire.GetPrimaryCoinType(msgTx)
@@ -4018,6 +4021,15 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 				"transaction %s:%d either does not exist or "+
 				"has already been spent", txInOutpoint,
 				txHash, idx)
+			return big.NewInt(0), ruleError(ErrMissingTxOut, str)
+		}
+
+		// Stake transactions are never allowed to spend transactions from the
+		// regular or stake tree of the same block.
+		if isStakeTx && utxoEntry.BlockHeight() == txHeight {
+			str := fmt.Sprintf("stake transaction input %s:%d tried to spend "+
+				"output %v at same height %d", txHash, idx, txInOutpoint,
+				txHeight)
 			return big.NewInt(0), ruleError(ErrMissingTxOut, str)
 		}
 
