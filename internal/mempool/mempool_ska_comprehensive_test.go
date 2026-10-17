@@ -5,6 +5,8 @@
 package mempool
 
 import (
+	"errors"
+	"math/big"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/chaincfg"
@@ -382,4 +384,34 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestRejectInputCoinTypeMismatch ensures the mempool rejects a transaction
+// that spends a VAR output in an SKA1 transaction with the consensus input coin
+// type rule, which runs before the mempool's own coin type policy.
+func TestRejectInputCoinTypeMismatch(t *testing.T) {
+	// Regnet has no active SKA coin type, so take SKA1 from simnet.
+	params := chaincfg.RegNetParams()
+	params.SKACoins = map[cointype.CoinType]*chaincfg.SKACoinConfig{
+		1: chaincfg.SimNetParams().SKACoins[1],
+	}
+	harness, spendableOuts, err := newPoolHarness(params)
+	if err != nil {
+		t.Fatalf("unable to create test pool: %v", err)
+	}
+
+	tx, err := harness.CreateSignedTx(spendableOuts[:1], 1, func(tx *wire.MsgTx) {
+		tx.TxOut[0].CoinType = 1
+		tx.TxOut[0].SKAValue = big.NewInt(tx.TxOut[0].Value)
+		tx.TxOut[0].Value = 0
+	})
+	if err != nil {
+		t.Fatalf("unable to create transaction: %v", err)
+	}
+
+	_, err = harness.txPool.ProcessTransaction(tx, false, true, 0)
+	if !errors.Is(err, blockchain.ErrInputCoinTypeMismatch) {
+		t.Fatalf("got error %v, want %v", err,
+			blockchain.ErrInputCoinTypeMismatch)
+	}
 }

@@ -3866,9 +3866,10 @@ func checkRevocationInputs(tx *dcrutil.Tx, txHeight int64, view *UtxoViewpoint,
 // inputs, it also calculates the total fees for the transaction and returns
 // that value.
 //
-// Note: SSFee transactions are not processed here as they have null inputs
-// like coinbase/treasurybase transactions. They are validated separately
-// through validateSSFeeTxns to ensure proper non-VAR fee distribution.
+// Note: Null-input SSFee transactions are not processed here as they have no
+// inputs to check, like coinbase/treasurybase transactions.  All SSFee
+// transactions are also validated through validateSSFeeTxns to ensure proper
+// fee distribution.
 //
 // NOTE: The transaction MUST have already been sanity checked with the
 // standalone.CheckTransactionSanity function prior to calling this function.
@@ -3990,6 +3991,7 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 
 	txHash := tx.Hash()
 	var totalAtomIn int64
+	txCoinType := wire.GetPrimaryCoinType(msgTx)
 	for idx, txIn := range msgTx.TxIn {
 		// Inputs won't exist for stakebase tx, so ignore them.
 		if isVote && idx == 0 {
@@ -4037,32 +4039,28 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 		}
 
 		if checkFraudProof {
-			// Fraud proof value check - SKA and VAR use different fields
-			if utxoEntry.CoinType().IsSKA() {
-				// SKA: compare SKAValueIn (bigint) vs SKAAmount (bigint)
-				// Regular ValueIn/Amount should be 0 for SKA
-				expectedSKA := utxoEntry.SKAAmount()
-				givenSKA := txIn.SKAValueIn
-				if expectedSKA == nil {
-					expectedSKA = new(big.Int)
-				}
-				if givenSKA == nil {
-					givenSKA = new(big.Int)
-				}
-				if expectedSKA.Cmp(givenSKA) != 0 {
-					str := fmt.Sprintf("bad fraud check SKA value in "+
-						"(expected %v, given %v) for txIn %v",
-						expectedSKA, givenSKA, idx)
-					return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
-				}
-			} else {
-				// VAR: compare ValueIn (int64) vs Amount (int64)
-				if txIn.ValueIn != utxoEntry.Amount() {
-					str := fmt.Sprintf("bad fraud check value in "+
-						"(expected %v, given %v) for txIn %v",
-						utxoEntry.Amount(), txIn.ValueIn, idx)
-					return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
-				}
+			// Both value fields must match the output being spent.  An SKA
+			// output has a zero atom amount and a VAR output has no SKA
+			// amount, so the field of the other coin type must be zero.
+			if txIn.ValueIn != utxoEntry.Amount() {
+				str := fmt.Sprintf("bad fraud check value in "+
+					"(expected %v, given %v) for txIn %v",
+					utxoEntry.Amount(), txIn.ValueIn, idx)
+				return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
+			}
+			expectedSKA := utxoEntry.SKAAmount()
+			givenSKA := txIn.SKAValueIn
+			if expectedSKA == nil {
+				expectedSKA = new(big.Int)
+			}
+			if givenSKA == nil {
+				givenSKA = new(big.Int)
+			}
+			if expectedSKA.Cmp(givenSKA) != 0 {
+				str := fmt.Sprintf("bad fraud check SKA value in "+
+					"(expected %v, given %v) for txIn %v",
+					expectedSKA, givenSKA, idx)
+				return big.NewInt(0), ruleError(ErrFraudAmountIn, str)
 			}
 
 			if int64(txIn.BlockHeight) != utxoEntry.BlockHeight() {
@@ -4080,6 +4078,15 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 					txIn.BlockIndex, idx)
 				return big.NewInt(0), ruleError(ErrFraudBlockIndex, str)
 			}
+		}
+
+		// Transactions are single-coin, so every input must spend an output
+		// of the coin type of the transaction.
+		if utxoEntry.CoinType() != txCoinType {
+			str := fmt.Sprintf("transaction %v input %d spends %v output %v "+
+				"in a %v transaction", txHash, idx, utxoEntry.CoinType(),
+				txInOutpoint, txCoinType)
+			return big.NewInt(0), ruleError(ErrInputCoinTypeMismatch, str)
 		}
 
 		// Ensure the transaction is not spending coins which have not

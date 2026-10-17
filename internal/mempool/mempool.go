@@ -1685,13 +1685,13 @@ func (mp *TxPool) maybeAcceptTransaction(tx *dcrutil.Tx, isNew, allowHighFees,
 			updateFraudProof = true
 		}
 
-		// Also check SKAValueIn for SKA UTXOs - if the UTXO has an SKA amount
-		// but the transaction input doesn't have matching SKAValueIn, update it.
+		// Also check SKAValueIn, which must be absent for VAR UTXOs and match
+		// the SKA amount for SKA UTXOs.
 		skaAmount := entry.SKAAmount()
-		if skaAmount != nil {
-			if txIn.SKAValueIn == nil || txIn.SKAValueIn.Cmp(skaAmount) != 0 {
-				updateFraudProof = true
-			}
+		if (skaAmount == nil) != (txIn.SKAValueIn == nil) ||
+			(skaAmount != nil && txIn.SKAValueIn.Cmp(skaAmount) != 0) {
+
+			updateFraudProof = true
 		}
 	}
 

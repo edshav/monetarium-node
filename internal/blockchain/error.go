@@ -461,6 +461,10 @@ const (
 	// fraudulent.
 	ErrFraudBlockIndex = ErrorKind("ErrFraudBlockIndex")
 
+	// ErrInputCoinTypeMismatch indicates a transaction input spends an output
+	// whose coin type differs from the coin type of the transaction.
+	ErrInputCoinTypeMismatch = ErrorKind("ErrInputCoinTypeMismatch")
+
 	// ErrZeroValueOutputSpend indicates that a transaction attempted to spend a
 	// zero value output.
 	ErrZeroValueOutputSpend = ErrorKind("ErrZeroValueOutputSpend")

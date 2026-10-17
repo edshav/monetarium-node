@@ -114,6 +114,7 @@ func TestErrorKindStringer(t *testing.T) {
 		{ErrFraudAmountIn, "ErrFraudAmountIn"},
 		{ErrFraudBlockHeight, "ErrFraudBlockHeight"},
 		{ErrFraudBlockIndex, "ErrFraudBlockIndex"},
+		{ErrInputCoinTypeMismatch, "ErrInputCoinTypeMismatch"},
 		{ErrZeroValueOutputSpend, "ErrZeroValueOutputSpend"},
 		{ErrInvalidEarlyVoteBits, "ErrInvalidEarlyVoteBits"},
 		{ErrInvalidEarlyFinalState, "ErrInvalidEarlyFinalState"},
