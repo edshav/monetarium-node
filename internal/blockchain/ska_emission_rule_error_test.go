@@ -24,9 +24,12 @@ import (
 // validation height whose SKA1 emission window opens emitOffset blocks after
 // stake validation height and stays open for window blocks, along with a
 // function that returns an SKA1 emission transaction for a given block height
-// signed with the given nonce.
+// signed with the given nonce after applying the given changes to the
+// transaction and its authorization.  SKA2 shares the SKA1 configuration but
+// has no activation vote.
 func newSKAEmissionRuleHarness(t *testing.T, emitOffset, window int64) (*chaingenHarness,
-	func(height int64, nonce uint64) *wire.MsgTx) {
+	func(height int64, nonce uint64,
+		mutate ...func(*wire.MsgTx, *chaincfg.SKAEmissionAuth)) *wire.MsgTx) {
 
 	t.Helper()
 
@@ -56,21 +59,30 @@ func newSKAEmissionRuleHarness(t *testing.T, emitOffset, window int64) (*chainge
 			EmissionKey:       priv.PubKey(),
 		},
 	}
+	ska2 := *params.SKACoins[1]
+	ska2.CoinType, ska2.Name, ska2.Symbol = 2, "Skarb-2", "SKA2"
+	params.SKACoins[2] = &ska2
 	params.InitialSKATypes = []cointype.CoinType{1}
 
 	g := newChaingenHarness(t, params)
 	g.AdvanceToStakeValidationHeight()
 
-	emission := func(height int64, nonce uint64) *wire.MsgTx {
+	emission := func(height int64, nonce uint64,
+		mutate ...func(*wire.MsgTx, *chaincfg.SKAEmissionAuth)) *wire.MsgTx {
+
 		tx := createTestEmissionTx(t, params.SKACoins[1].EmissionAddresses,
 			[]*big.Int{amount}, 1, params)
-		signEmissionTx(t, tx, &chaincfg.SKAEmissionAuth{
+		auth := &chaincfg.SKAEmissionAuth{
 			EmissionKey: priv.PubKey(),
 			CoinType:    1,
 			Nonce:       nonce,
 			Amount:      amount,
 			Height:      height,
-		}, priv, params)
+		}
+		for _, f := range mutate {
+			f(tx, auth)
+		}
+		signEmissionTx(t, tx, auth, priv, params)
 		tx.TxIn[0].BlockHeight = wire.NullBlockHeight
 		tx.TxIn[0].BlockIndex = wire.NullBlockIndex
 		return tx
@@ -92,6 +104,22 @@ func expectKnownInvalid(g *chaingenHarness, blockName string, want bool) {
 		g.t.Fatalf("block %q known invalid: got %v, want %v", blockName, got,
 			want)
 	}
+}
+
+// expectStateConflict ensures the named block is rejected with a conflict with
+// the recorded SKA emission state whose message contains want, without a rule
+// error, and is not marked invalid.
+func expectStateConflict(g *chaingenHarness, blockName, want string) {
+	g.t.Helper()
+
+	_, err := g.chain.ProcessBlock(dcrutil.NewBlock(g.BlockByName(blockName)))
+	var rErr RuleError
+	if err == nil || errors.As(err, &rErr) || !isSKAEmissionStateError(err) ||
+		!strings.Contains(err.Error(), want) {
+		g.t.Fatalf("block %q not rejected with a %q state conflict without a "+
+			"rule error: %v", blockName, want, err)
+	}
+	expectKnownInvalid(g, blockName, false)
 }
 
 // TestSKAEmissionRuleErrors ensures a block that violates an SKA emission rule
@@ -161,17 +189,7 @@ func TestSKAEmissionRuleErrors(t *testing.T) {
 		g.NextBlock("bagain", nil, outs[1:], func(b *wire.MsgBlock) {
 			b.AddTransaction(emission(height+1, 2))
 		})
-		_, err := g.chain.ProcessBlock(dcrutil.NewBlock(g.Tip()))
-		if err == nil {
-			t.Fatal("second SKA1 emission was accepted")
-		}
-		var rErr RuleError
-		if errors.As(err, &rErr) || !isSKAEmissionStateError(err) ||
-			!strings.Contains(err.Error(), "already been emitted") {
-			t.Fatalf("second SKA1 emission not rejected as already emitted "+
-				"without a rule error: %v", err)
-		}
-		expectKnownInvalid(g, "bagain", false)
+		expectStateConflict(g, "bagain", "already been emitted")
 
 		// A conflict with the recorded emission state must not hide a rule
 		// violation later in the same block.
@@ -236,5 +254,138 @@ func TestSKAEmissionRuleErrors(t *testing.T) {
 		g.NextBlock("bgood", nil, outs[1:])
 		g.AcceptTipBlock()
 		g.ExpectTip("bgood")
+	})
+
+	t.Run("RuleViolations", func(t *testing.T) {
+		g, emission := newSKAEmissionRuleHarness(t, 1, 100)
+		parent := g.TipName()
+		height := int64(g.Tip().Header.Height) + 1
+		outs := g.OldestCoinbaseOuts()
+
+		// bauthver through bmulti each hold the valid SKA1 emission at this
+		// height with one change that breaks a single rule, signed after the
+		// change.  bnoncesig and bnonceska break a rule next to an emission
+		// with an unexpected nonce, which must not hide the violation.
+		//
+		//   ... -> bsvh -> bauthver  (authorization encoded as version 2)
+		//              \-> blocklock (lock time set)
+		//              \-> bexpiry   (expiry past the window end)
+		//              \-> bwrongkey (signed with another key)
+		//              \-> baddr     (output pays another script hash)
+		//              \-> bamount   (output and authorized amount one atom short)
+		//              \-> bauthamt  (authorized amount one atom short)
+		//              \-> bcointype (SKA2 authorization on SKA1 outputs)
+		//              \-> bnokey    (authorization for unconfigured SKA3)
+		//              \-> bvote     (SKA2 emission without its activation vote)
+		//              \-> bmulti    (two SKA1 emissions)
+		//              \-> bnoncesig (nonce 2 emission and a forged signature)
+		//              \-> bnonceska (nonce 2 emission and a payment in SKA3)
+		//              \-> bgood -> bnonce (nonce 2 emission before any SKA1
+		//                                   emission)
+		rejectSibling := func(blockName string, txns ...*wire.MsgTx) {
+			t.Helper()
+
+			g.SetTip(parent)
+			g.NextBlock(blockName, nil, outs[1:], func(b *wire.MsgBlock) {
+				for _, tx := range txns {
+					b.AddTransaction(tx)
+				}
+			})
+			g.RejectTipBlock(ErrInvalidSKAEmission)
+			expectKnownInvalid(g, blockName, true)
+		}
+
+		// Byte 4 is the authorization version, after the 4-byte SKA marker.
+		authVer := emission(height, 1)
+		authVer.TxIn[0].SignatureScript[4] = 0x02
+		rejectSibling("bauthver", authVer)
+
+		rejectSibling("blocklock", emission(height, 1,
+			func(tx *wire.MsgTx, _ *chaincfg.SKAEmissionAuth) {
+				tx.LockTime = 1
+			}))
+
+		rejectSibling("bexpiry", emission(height, 1,
+			func(tx *wire.MsgTx, _ *chaincfg.SKAEmissionAuth) {
+				tx.Expiry++
+			}))
+
+		otherKey, err := secp256k1.GeneratePrivateKey()
+		if err != nil {
+			t.Fatalf("failed to generate key: %v", err)
+		}
+		wrongKey := emission(height, 1)
+		signEmissionTx(t, wrongKey, &chaincfg.SKAEmissionAuth{
+			EmissionKey: otherKey.PubKey(),
+			CoinType:    1,
+			Nonce:       1,
+			Amount:      wrongKey.TxOut[0].SKAValue,
+			Height:      height,
+		}, otherKey, g.chain.chainParams)
+		rejectSibling("bwrongkey", wrongKey)
+
+		rejectSibling("baddr", emission(height, 1,
+			func(tx *wire.MsgTx, _ *chaincfg.SKAEmissionAuth) {
+				tx.TxOut[0].PkScript[2] ^= 0xff
+			}))
+
+		rejectSibling("bamount", emission(height, 1,
+			func(tx *wire.MsgTx, auth *chaincfg.SKAEmissionAuth) {
+				auth.Amount = new(big.Int).Sub(auth.Amount, big.NewInt(1))
+				tx.TxOut[0].SKAValue = auth.Amount
+			}))
+
+		rejectSibling("bauthamt", emission(height, 1,
+			func(_ *wire.MsgTx, auth *chaincfg.SKAEmissionAuth) {
+				auth.Amount = new(big.Int).Sub(auth.Amount, big.NewInt(1))
+			}))
+
+		rejectSibling("bcointype", emission(height, 1,
+			func(_ *wire.MsgTx, auth *chaincfg.SKAEmissionAuth) {
+				auth.CoinType = 2
+			}))
+
+		rejectSibling("bnokey", emission(height, 1,
+			func(_ *wire.MsgTx, auth *chaincfg.SKAEmissionAuth) {
+				auth.CoinType = 3
+			}))
+
+		rejectSibling("bvote", emission(height, 1,
+			func(tx *wire.MsgTx, auth *chaincfg.SKAEmissionAuth) {
+				tx.TxOut[0].CoinType = 2
+				auth.CoinType = 2
+			}))
+
+		rejectSibling("bmulti", emission(height, 1), emission(height, 1,
+			func(tx *wire.MsgTx, _ *chaincfg.SKAEmissionAuth) {
+				tx.Expiry--
+			}))
+
+		badSigTx := emission(height, 1)
+		badSigTx.Expiry--
+		rejectSibling("bnoncesig", emission(height, 2), badSigTx)
+
+		g.SetTip(parent)
+		g.NextBlock("bnonceska", &outs[0], outs[1:], func(b *wire.MsgBlock) {
+			out := b.Transactions[1].TxOut[0]
+			out.CoinType, out.SKAValue, out.Value = 3, big.NewInt(out.Value), 0
+			b.AddTransaction(emission(height, 2))
+		})
+		g.RejectTipBlock(ErrInvalidSKAEmission)
+		expectKnownInvalid(g, "bnonceska", true)
+
+		g.SetTip(parent)
+		g.NextBlock("bgood", nil, outs[1:])
+		g.SaveTipCoinbaseOuts()
+		g.AcceptTipBlock()
+		g.ExpectTip("bgood")
+
+		// bnonce extends bgood rather than competing with it, since a block
+		// that is not marked invalid wins a tie with a later sibling.
+		outs = g.OldestCoinbaseOuts()
+		g.NextBlock("bnonce", nil, outs[1:], func(b *wire.MsgBlock) {
+			b.AddTransaction(emission(height+1, 2))
+		})
+		expectStateConflict(g, "bnonce", "invalid nonce")
 	})
 }
