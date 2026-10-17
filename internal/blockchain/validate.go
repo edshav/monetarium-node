@@ -2554,18 +2554,22 @@ func SSFeeType(tx *wire.MsgTx) (string, error) {
 // spentSSFeeType returns the type (SF or MF) of the SSFee transaction that
 // created the output spent by the provided real SSFee input.  The fraud proof of
 // the input locates that transaction in the stake tree of the block at its
-// height on the branch that ends with the passed node and block.
+// height on the branch that ends with the parent of the passed node.  The block
+// is read once per height and kept in srcBlocks, so augmented SSFee transactions
+// of one block that spend outputs of the same block do not read it again.
 //
 // NOTE: The fraud proof MUST have already been checked against the spent
 // output, which CheckTransactionInputs does for every input of a block being
-// connected, and the spent output MUST have been created by an SSFee
-// transaction.
-func (b *BlockChain) spentSSFeeType(block *dcrutil.Block, node *blockNode,
-	txIn *wire.TxIn) (string, error) {
+// connected, along with the rule that a stake transaction does not spend an
+// output of its own block, and the spent output MUST have been created by an
+// SSFee transaction.
+func (b *BlockChain) spentSSFeeType(node *blockNode, txIn *wire.TxIn,
+	srcBlocks map[int64]*dcrutil.Block) (string, error) {
 
-	srcBlock := block
-	if height := int64(txIn.BlockHeight); height != node.height {
-		srcNode := node.Ancestor(height)
+	height := int64(txIn.BlockHeight)
+	srcBlock := srcBlocks[height]
+	if srcBlock == nil {
+		srcNode := node.parent.Ancestor(height)
 		if srcNode == nil {
 			return "", AssertError(fmt.Sprintf("SSFee input %v refers to "+
 				"height %d which is not an ancestor of block %s (height %d)",
@@ -2576,6 +2580,7 @@ func (b *BlockChain) spentSSFeeType(block *dcrutil.Block, node *blockNode,
 		if err != nil {
 			return "", err
 		}
+		srcBlocks[height] = srcBlock
 	}
 
 	stxns := srcBlock.STransactions()
@@ -2619,11 +2624,10 @@ func (b *BlockChain) spentSSFeeType(block *dcrutil.Block, node *blockNode,
 // - All non-VAR coin types with miner fees have corresponding SSFee transactions
 //
 // Note: All SSFee transactions skip script validation in checkBlockScripts since
-// their signature scripts must be empty.  CheckTransactionInputs instead requires
-// the real input of an augmented SSFee to spend an SSFee output and every output
-// other than an OP_RETURN output, of which there must be at least one, to pay to
-// the script of the output it spends.  This function also requires that output
-// to come from an SSFee transaction of the same type (SF or MF).
+// their signature scripts must be empty.  CheckTransactionInputs checks the real
+// input of an augmented SSFee with checkAugmentedSSFeeInput, and this function
+// also requires the spent output to come from an SSFee transaction of the same
+// type (SF or MF).
 func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	votes []*dcrutil.Tx, ssFeeTxns []*wire.MsgTx, totalFees wire.FeesByType, subsidySplitVariant standalone.SubsidySplitVariant) error {
 
@@ -2729,6 +2733,7 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 	distributedStakerFees := make(map[cointype.CoinType]int64)
 	actualDistribution := make(map[string]int64)       // Track per-consolidation-address distribution for VAR
 	actualDistributionSKA := make(map[string]*big.Int) // Track per-consolidation-address distribution for SKA
+	srcBlocks := make(map[int64]*dcrutil.Block)        // Blocks read for the type of a spent SSFee output
 
 	// Validate each SSFee transaction
 	for _, ssFeeTx := range ssFeeTxns {
@@ -3016,7 +3021,8 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 		// This runs after the checks above since it reads the block holding
 		// that output.
 		if !isNullInput {
-			spentFeeType, err := b.spentSSFeeType(block, node, ssFeeTx.TxIn[0])
+			spentFeeType, err := b.spentSSFeeType(node, ssFeeTx.TxIn[0],
+				srcBlocks)
 			if err != nil {
 				return err
 			}

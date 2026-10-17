@@ -458,77 +458,9 @@ func augmentingSSFeeTxIn(src *wire.MsgTx, height int64, index uint32) *wire.TxIn
 	return txIn
 }
 
-// TestValidateSSFeeTxnsAugmentedSameType ensures validateSSFeeTxns accepts
-// staker and miner SKA SSFee transactions that each augment an output of an
-// earlier SSFee transaction of the same type, each with one payment output.
-func TestValidateSSFeeTxnsAugmentedSameType(t *testing.T) {
-	params := chaincfg.SimNetParams()
-	b := newFakeChain(params)
-	const ska1 = cointype.CoinType(1)
-
-	stakerHash := bytes.Repeat([]byte{0x11}, 20)
-	stakerScript, err := stake.ConsolidationAddrToPkScript(stakerHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	minerScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x22}, 20))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// The parent block holds a staker and a miner SSFee.
-	srcSF := newNullInputSSFeeTestTx(ska1, stake.CreateStakerSSFeeMarker(1, 0),
-		5000, stakerScript)
-	srcMF := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(1),
-		3000, minerScript)
-	srcMsgBlock := &wire.MsgBlock{
-		Header:        wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1},
-		STransactions: []*wire.MsgTx{srcSF, srcMF},
-	}
-	srcNode := newBlockNode(&srcMsgBlock.Header, b.bestChain.Tip())
-	b.recentBlocks.Put(srcNode.hash, dcrutil.NewBlock(srcMsgBlock))
-
-	// The block holds a vote for the staker and the SSFee transactions that
-	// augment both outputs of the parent block with this block's fees.
-	totalFees := wire.NewFeesByType()
-	totalFees.Add(ska1, 1000)
-	work, stakeShare, _, _ := standalone.GetSubsidyProportions(standalone.SSVMonetarium)
-	minerFees, stakerFees := wire.CalcFeeSplitByCoinType(totalFees, work, stakeShare)
-
-	vote := wire.NewMsgTx()
-	vote.AddTxOut(&wire.TxOut{PkScript: []byte{txscript.OP_RETURN}})
-	vote.AddTxOut(&wire.TxOut{PkScript: []byte{txscript.OP_RETURN}})
-	vote.AddTxOut(&wire.TxOut{Value: 100, PkScript: stakerScript[1:]})
-	consolidation, err := stake.CreateSSFeeConsolidationOutput(stakerHash)
-	if err != nil {
-		t.Fatal(err)
-	}
-	vote.AddTxOut(consolidation)
-
-	augSF := newSSFeeTestTx(augmentingSSFeeTxIn(srcSF, 1, 0), ska1,
-		stake.CreateStakerSSFeeMarker(2, 0),
-		5000+stakerFees.GetBig(ska1).Int64(), stakerScript)
-	augMF := newSSFeeTestTx(augmentingSSFeeTxIn(srcMF, 1, 1), ska1,
-		stake.CreateMinerSSFeeMarker(2),
-		3000+minerFees.GetBig(ska1).Int64(), minerScript)
-	msgBlock := &wire.MsgBlock{
-		Header:        wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2},
-		STransactions: []*wire.MsgTx{vote, augSF, augMF},
-	}
-	node := newBlockNode(&msgBlock.Header, srcNode)
-
-	err = b.validateSSFeeTxns(dcrutil.NewBlock(msgBlock), node,
-		[]*dcrutil.Tx{dcrutil.NewTx(vote)}, []*wire.MsgTx{augSF, augMF},
-		totalFees, standalone.SSVMonetarium)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
 // TestValidateSSFeeTxnsRejectsMismatchedType ensures validateSSFeeTxns rejects
 // an SSFee transaction that augments an output of an SSFee transaction of the
-// other type, in both directions, whether that transaction is in the parent
-// block or earlier in the same block.
+// other type, in both directions.
 func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 	params := chaincfg.SimNetParams()
 	b := newFakeChain(params)
@@ -570,12 +502,7 @@ func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 	stakerFee := stakerFees.GetBig(ska1).Int64()
 
 	// Each block holds one SSFee that augments an output of the other type
-	// and one valid null-input SSFee, which in the same-block cases is the
-	// SSFee whose output is augmented.
-	sameBlockSF := newNullInputSSFeeTestTx(ska1,
-		stake.CreateStakerSSFeeMarker(2, 0), stakerFee, payScript)
-	sameBlockMF := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(2),
-		minerFee, payScript)
+	// and one valid null-input SSFee.
 	tests := []struct {
 		name      string
 		ssFeeTxns []*wire.MsgTx
@@ -595,20 +522,6 @@ func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 			newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(2),
 				minerFee, payScript),
 		},
-	}, {
-		name: "miner SSFee spends a staker SSFee output in the same block",
-		ssFeeTxns: []*wire.MsgTx{
-			sameBlockSF,
-			newSSFeeTestTx(augmentingSSFeeTxIn(sameBlockSF, 2, 1), ska1,
-				stake.CreateMinerSSFeeMarker(2), stakerFee+minerFee, payScript),
-		},
-	}, {
-		name: "staker SSFee spends a miner SSFee output in the same block",
-		ssFeeTxns: []*wire.MsgTx{
-			sameBlockMF,
-			newSSFeeTestTx(augmentingSSFeeTxIn(sameBlockMF, 2, 1), ska1,
-				stake.CreateStakerSSFeeMarker(2, 0), minerFee+stakerFee, payScript),
-		},
 	}}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -626,36 +539,6 @@ func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 				t.Fatalf("got error %v, want ErrBadSSFeeInput", err)
 			}
 		})
-	}
-}
-
-// TestSpentSSFeeTypeSameBlock ensures spentSSFeeType finds an SSFee output
-// created earlier in the block being connected.
-func TestSpentSSFeeTypeSameBlock(t *testing.T) {
-	params := chaincfg.SimNetParams()
-	b := newFakeChain(params)
-	const ska1 = cointype.CoinType(1)
-
-	pkScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x22}, 20))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	src := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(1),
-		3000, pkScript)
-	msgBlock := &wire.MsgBlock{
-		Header:        wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1},
-		STransactions: []*wire.MsgTx{src},
-	}
-	node := newBlockNode(&msgBlock.Header, b.bestChain.Tip())
-
-	feeType, err := b.spentSSFeeType(dcrutil.NewBlock(msgBlock), node,
-		augmentingSSFeeTxIn(src, 1, 0))
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if feeType != "MF" {
-		t.Fatalf("got SSFee type %q, want MF", feeType)
 	}
 }
 
@@ -678,18 +561,24 @@ func TestSpentSSFeeTypeRejectsInvalidReference(t *testing.T) {
 	noMarker := wire.NewMsgTx()
 	noMarker.AddTxOut(newTestTxOut(ska1, 0, []byte{txscript.OP_RETURN}))
 	noMarker.AddTxOut(newTestTxOut(ska1, 3000, pkScript))
-	msgBlock := &wire.MsgBlock{
+	srcBlock := &wire.MsgBlock{
 		Header:        wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1},
 		STransactions: []*wire.MsgTx{src, other, noMarker},
 	}
-	node := newBlockNode(&msgBlock.Header, b.bestChain.Tip())
+	srcNode := newBlockNode(&srcBlock.Header, b.bestChain.Tip())
+	b.recentBlocks.Put(srcNode.hash, dcrutil.NewBlock(srcBlock))
+	header := wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2}
+	node := newBlockNode(&header, srcNode)
 
 	tests := []struct {
 		name string
 		txIn *wire.TxIn
 	}{{
-		name: "height above the block",
+		name: "height of the block",
 		txIn: augmentingSSFeeTxIn(src, 2, 0),
+	}, {
+		name: "height above the block",
+		txIn: augmentingSSFeeTxIn(src, 3, 0),
 	}, {
 		name: "out of range stake transaction index",
 		txIn: augmentingSSFeeTxIn(src, 1, 3),
@@ -704,8 +593,8 @@ func TestSpentSSFeeTypeRejectsInvalidReference(t *testing.T) {
 	}}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := b.spentSSFeeType(dcrutil.NewBlock(msgBlock), node,
-				test.txIn)
+			_, err := b.spentSSFeeType(node, test.txIn,
+				make(map[int64]*dcrutil.Block))
 			var assertErr AssertError
 			if !errors.As(err, &assertErr) {
 				t.Fatalf("got error %v, want AssertError", err)
@@ -716,7 +605,8 @@ func TestSpentSSFeeTypeRejectsInvalidReference(t *testing.T) {
 
 // TestSpentSSFeeTypeFetchError ensures spentSSFeeType returns the error of a
 // failed block fetch as is, not as a rule error, so a database fault does not
-// mark the block being connected invalid.
+// mark the block being connected invalid, and that it does not fetch a block it
+// has already read.
 func TestSpentSSFeeTypeFetchError(t *testing.T) {
 	params := chaincfg.SimNetParams()
 	b, err := chainSetup(t, params)
@@ -735,18 +625,27 @@ func TestSpentSSFeeTypeFetchError(t *testing.T) {
 		3000, pkScript)
 	srcHeader := wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1}
 	srcNode := newBlockNode(&srcHeader, b.bestChain.Tip())
-	msgBlock := &wire.MsgBlock{
-		Header: wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2},
-	}
-	node := newBlockNode(&msgBlock.Header, srcNode)
+	header := wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2}
+	node := newBlockNode(&header, srcNode)
 
-	_, err = b.spentSSFeeType(dcrutil.NewBlock(msgBlock), node,
-		augmentingSSFeeTxIn(src, 1, 0))
+	_, err = b.spentSSFeeType(node, augmentingSSFeeTxIn(src, 1, 0),
+		make(map[int64]*dcrutil.Block))
 	if !errors.Is(err, database.ErrBlockNotFound) {
 		t.Fatalf("got error %v, want database.ErrBlockNotFound", err)
 	}
 	var rerr RuleError
 	if errors.As(err, &rerr) {
 		t.Fatalf("got rule error %v, want the fetch error", err)
+	}
+
+	// A block already read for the block being connected is not fetched
+	// again.
+	srcBlock := &wire.MsgBlock{Header: srcHeader,
+		STransactions: []*wire.MsgTx{src}}
+	srcBlocks := map[int64]*dcrutil.Block{1: dcrutil.NewBlock(srcBlock)}
+	feeType, err := b.spentSSFeeType(node, augmentingSSFeeTxIn(src, 1, 0),
+		srcBlocks)
+	if err != nil || feeType != "MF" {
+		t.Fatalf("got SSFee type %q and error %v, want MF", feeType, err)
 	}
 }
