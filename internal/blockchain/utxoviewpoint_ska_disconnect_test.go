@@ -5,6 +5,7 @@
 package blockchain
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/monetarium/monetarium-node/chaincfg/chainhash"
 	"github.com/monetarium/monetarium-node/cointype"
 	"github.com/monetarium/monetarium-node/dcrec/secp256k1"
+	"github.com/monetarium/monetarium-node/dcrutil"
 	"github.com/monetarium/monetarium-node/txscript"
 	"github.com/monetarium/monetarium-node/txscript/stdaddr"
 	"github.com/monetarium/monetarium-node/wire"
@@ -336,4 +338,84 @@ func TestDisconnectSKAOutputs(t *testing.T) {
 		h.assertSKASpendUndone(spendTx)
 		h.assertSSFeeOutputsGone(bx)
 	})
+}
+
+// TestDisconnectUnspendableOutputs ensures that undoing the regular
+// transactions of a block leaves out of the view each output the connect path
+// never added to the utxo set, for both SKA and VAR, while still marking the
+// spendable output of the same transaction spent.
+//
+// Skipping an output and adding it to the view spent leave the same utxo set
+// once the view is committed, so the cases inspect the view right after the
+// disapproval of the block disconnects its regular tree.
+func TestDisconnectUnspendableOutputs(t *testing.T) {
+	tests := []struct {
+		name  string
+		txOut *wire.TxOut // appended to the spend transaction of its coin type
+	}{{
+		name:  "SKA zero amount",
+		txOut: &wire.TxOut{SKAValue: new(big.Int), CoinType: 1, PkScript: []byte{txscript.OP_TRUE}},
+	}, {
+		name:  "SKA OP_RETURN",
+		txOut: &wire.TxOut{SKAValue: big.NewInt(1), CoinType: 1, PkScript: []byte{txscript.OP_RETURN}},
+	}, {
+		name: "SKA script over max size",
+		txOut: &wire.TxOut{SKAValue: big.NewInt(1), CoinType: 1,
+			PkScript: bytes.Repeat([]byte{txscript.OP_TRUE}, txscript.MaxScriptSize+1)},
+	}, {
+		name:  "VAR zero amount",
+		txOut: &wire.TxOut{PkScript: []byte{txscript.OP_TRUE}},
+	}, {
+		name:  "VAR OP_RETURN",
+		txOut: &wire.TxOut{Value: 1, PkScript: []byte{txscript.OP_RETURN}},
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newSKADisconnectHarness(t)
+
+			// The output takes its amount from the first output of its
+			// transaction, so the fees stay those of the passing layout.
+			//
+			//   ... -> bskamat# -> bx (spends a coinbase output and the SKA
+			//                          emission)
+			spendTx := h.createSKASpendTx()
+			var tx *wire.MsgTx
+			outs := h.OldestCoinbaseOuts()
+			h.NextBlock("bx", &outs[0], outs[1:], func(b *wire.MsgBlock) {
+				tx = b.Transactions[1]
+				if test.txOut.CoinType.IsSKA() {
+					tx = spendTx
+					tx.TxOut[0].SKAValue.Sub(tx.TxOut[0].SKAValue,
+						test.txOut.SKAValue)
+				}
+				tx.TxOut[0].Value -= test.txOut.Value
+				tx.AddTxOut(test.txOut)
+				addSKASpendTx(b, spendTx)
+			})
+			h.AcceptTipBlock()
+
+			// Fetch the view of tx with the regular tree of the tip bx undone,
+			// as a block disapproving bx sees it.
+			view, err := h.chain.FetchUtxoView(dcrutil.NewTx(tx), false)
+			if err != nil {
+				t.Fatalf("FetchUtxoView: %v", err)
+			}
+
+			txHash := tx.TxHash()
+			spendable := wire.OutPoint{Hash: txHash, Tree: wire.TxTreeRegular}
+			if entry := view.LookupEntry(spendable); entry == nil ||
+				!entry.IsSpent() {
+				t.Fatalf("spendable output %v of the undone transaction is "+
+					"not marked spent in the view", spendable)
+			}
+			unspendable := wire.OutPoint{Hash: txHash,
+				Index: uint32(len(tx.TxOut) - 1), Tree: wire.TxTreeRegular}
+			if entry := view.LookupEntry(unspendable); entry != nil {
+				t.Errorf("provably unspendable output %v of the undone "+
+					"transaction has a view entry (spent %v)", unspendable,
+					entry.IsSpent())
+			}
+		})
+	}
 }
