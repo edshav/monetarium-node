@@ -20,7 +20,8 @@ import (
 
 // TestSSFeeDistributesSKAFees ensures a block with an SKA1 emission in the
 // emission window and blocks whose SSFee transactions distribute the SKA1 fees
-// of the block, unscaled by the number of votes, are accepted.
+// of the block, unscaled by the number of votes, are accepted, and blocks whose
+// SSFee transactions distribute any other amount are rejected.
 func TestSSFeeDistributesSKAFees(t *testing.T) {
 	// Use the simnet SKA1 configuration on regnet, which the generator
 	// supports, and emit SKA1 to the pay-to-script-hash OP_TRUE address of
@@ -61,10 +62,6 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	// emission has an expiry.
 	g.AdvanceToHeight(uint32(emitHeight)+uint32(params.CoinbaseMaturity), 1)
 
-	// skaFeeBlock returns a munger that adds an SKA1 transaction spending
-	// prevOut, worth amount and created at prevHeight and prevIndex, that
-	// pays the given fee, along with the staker and miner SSFee transactions
-	// that distribute it.
 	payScript := emission.TxOut[0].PkScript
 	minerScript, err := stake.ConsolidationAddrToPkScript(make([]byte, 20))
 	if err != nil {
@@ -75,8 +72,12 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// skaFeeBlock returns a munger that adds an SKA1 transaction spending
+	// prevOut, worth amount and created at prevHeight and prevIndex, that
+	// pays the given fee, along with the staker and miner SSFee transactions
+	// that distribute distFee.
 	skaFeeBlock := func(prevOut wire.OutPoint, amount *big.Int, prevHeight,
-		prevIndex uint32, fee *big.Int) func(*wire.MsgBlock) {
+		prevIndex uint32, fee, distFee *big.Int) func(*wire.MsgBlock) {
 
 		return func(b *wire.MsgBlock) {
 			spend := wire.NewMsgTx()
@@ -94,7 +95,7 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 			b.AddTransaction(spend)
 
 			fees := wire.NewFeesByType()
-			fees.AddBig(1, fee)
+			fees.AddBig(1, distFee)
 			work, stakeShare, _, _ := standalone.GetSubsidyProportions(
 				standalone.SSVMonetarium)
 			minerFees, stakerFees := wire.CalcFeeSplitByCoinType(fees, work,
@@ -132,18 +133,67 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	emitAmount := cfg.EmissionAmounts[0]
 	outs = g.OldestCoinbaseOuts()
 	g.NextBlock("bska5", nil, outs[1:], skaFeeBlock(emitOut, emitAmount,
-		uint32(emitHeight), emitIndex, fee))
+		uint32(emitHeight), emitIndex, fee, fee))
 	g.AcceptTipBlock()
 
-	// Spend its change with fewer votes.
-	//
-	//   ... -> bska5 -> bska4
+	// spendChange returns a munger that spends the change of bska5 with
+	// fewer votes and distributes distFee.
 	tip := g.Tip()
 	change := tip.Transactions[len(tip.Transactions)-1]
 	changeOut := wire.OutPoint{Hash: change.TxHash(), Index: 0}
-	g.NextBlock("bska4", nil, nil, g.ReplaceWithNVotes(4),
-		skaFeeBlock(changeOut, change.TxOut[0].SKAValue, tip.Header.Height,
-			uint32(len(tip.Transactions)-1), fee))
+	spendChange := func(distFee *big.Int) func(*wire.MsgBlock) {
+		return skaFeeBlock(changeOut, change.TxOut[0].SKAValue,
+			tip.Header.Height, uint32(len(tip.Transactions)-1), fee, distFee)
+	}
+
+	// Create blocks that distribute the SKA1 fee scaled by the number of
+	// votes, as VAR fees are, and more than the fee, a block without the miner
+	// SSFee transaction and blocks whose miner or staker SSFee transaction
+	// alone pays one atom more.
+	//
+	//   ... -> bska5 -> bscaled
+	//              \-> bover
+	//              \-> bnominer
+	//              \-> bminerover
+	//              \-> bstakerover
+	const votes = 4
+	tests := []struct {
+		name    string
+		distFee *big.Int
+		munger  func(*wire.MsgBlock)
+	}{
+		{name: "bscaled", distFee: new(big.Int).Div(
+			new(big.Int).Mul(fee, big.NewInt(votes)),
+			big.NewInt(int64(params.TicketsPerBlock)))},
+		{name: "bover", distFee: new(big.Int).Add(fee, big.NewInt(2))},
+		{name: "bnominer", distFee: fee, munger: func(b *wire.MsgBlock) {
+			b.STransactions = b.STransactions[:len(b.STransactions)-1]
+		}},
+		{name: "bminerover", distFee: fee, munger: func(b *wire.MsgBlock) {
+			out := b.STransactions[len(b.STransactions)-1].TxOut[1]
+			out.SKAValue = new(big.Int).Add(out.SKAValue, big.NewInt(1))
+		}},
+		{name: "bstakerover", distFee: fee, munger: func(b *wire.MsgBlock) {
+			out := b.STransactions[len(b.STransactions)-2].TxOut[1]
+			out.SKAValue = new(big.Int).Add(out.SKAValue, big.NewInt(1))
+		}},
+	}
+	for _, test := range tests {
+		mungers := []func(*wire.MsgBlock){g.ReplaceWithNVotes(votes),
+			spendChange(test.distFee)}
+		if test.munger != nil {
+			mungers = append(mungers, test.munger)
+		}
+		g.SetTip("bska5")
+		g.NextBlock(test.name, nil, nil, mungers...)
+		g.RejectTipBlock(ErrStakeFees)
+	}
+
+	// Spend the change with fewer votes and distribute the fee in full.
+	//
+	//   ... -> bska5 -> bska4
+	g.SetTip("bska5")
+	g.NextBlock("bska4", nil, nil, g.ReplaceWithNVotes(votes), spendChange(fee))
 	g.AcceptTipBlock()
 }
 
