@@ -524,6 +524,14 @@ func checkTransactionContext(tx *wire.MsgTx, params *chaincfg.Params, flags Agen
 			return ruleError(ErrBadTxInput, str)
 		}
 
+		// An output of a transaction with an expiry needs coinbase maturity,
+		// so an SSFee that augments the output of another owner could
+		// otherwise keep the owner from spending it.
+		if tx.Expiry != wire.NoExpiryValue {
+			str := fmt.Sprintf("SSFee transaction has expiry %d", tx.Expiry)
+			return ruleError(ErrSSFeeExpiry, str)
+		}
+
 		// Additional validation of a real input (UTXO existence, the type and
 		// script of the spent output) happens in CheckTransactionInputs() where
 		// the UTXO viewpoint is available.

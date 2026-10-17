@@ -105,6 +105,7 @@ func TestErrorKindStringer(t *testing.T) {
 		{ErrBadStakebaseValue, "ErrBadStakebaseValue"},
 		{ErrStakeFees, "ErrStakeFees"},
 		{ErrBadSSFeeInput, "ErrBadSSFeeInput"},
+		{ErrSSFeeExpiry, "ErrSSFeeExpiry"},
 		{ErrNoStakeTx, "ErrNoStakeTx"},
 		{ErrBadBlockHeight, "ErrBadBlockHeight"},
 		{ErrBlockOneTx, "ErrBlockOneTx"},

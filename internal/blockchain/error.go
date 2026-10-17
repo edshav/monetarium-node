@@ -427,6 +427,9 @@ const (
 	// spends, or has no output other than an OP_RETURN output.
 	ErrBadSSFeeInput = ErrorKind("ErrBadSSFeeInput")
 
+	// ErrSSFeeExpiry indicates an SSFee transaction sets an expiry.
+	ErrSSFeeExpiry = ErrorKind("ErrSSFeeExpiry")
+
 	// ErrNoStakeTx indicates there were no stake transactions found in a
 	// block after stake validation height.
 	ErrNoStakeTx = ErrorKind("ErrNoStakeTx")

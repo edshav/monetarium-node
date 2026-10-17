@@ -683,3 +683,34 @@ func TestSpentSSFeeTypeFetchError(t *testing.T) {
 		t.Fatalf("got SSFee type %q and error %v, want MF", feeType, err)
 	}
 }
+
+// TestCheckTransactionRejectsSSFeeExpiry ensures SSFee transactions with a null
+// or a real input are rejected when they set an expiry.
+func TestCheckTransactionRejectsSSFeeExpiry(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	const originHeight = 1000
+
+	pkScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x11}, 20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := newSSFeeTestOutput(cointype.CoinTypeVAR, 5000, pkScript,
+		originHeight)
+	marker := stake.CreateStakerSSFeeMarker(originHeight+1, 0)
+	tests := map[string]*wire.MsgTx{
+		"null input": newNullInputSSFeeTestTx(cointype.CoinTypeVAR, marker,
+			700, pkScript),
+		"real input": newSSFeeTestTx(prev.spendingTxIn(), cointype.CoinTypeVAR,
+			marker, 5700, pkScript),
+	}
+	for name, tx := range tests {
+		if err := CheckTransaction(tx, params, AFNone); err != nil {
+			t.Fatalf("%s: unexpected error without an expiry: %v", name, err)
+		}
+		tx.Expiry = originHeight + 2
+		err := CheckTransaction(tx, params, AFNone)
+		if !errors.Is(err, ErrSSFeeExpiry) {
+			t.Fatalf("%s: got error %v, want ErrSSFeeExpiry", name, err)
+		}
+	}
+}
