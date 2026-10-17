@@ -247,6 +247,10 @@ const (
 	// an SKA emission transaction does not have the required authorized format.
 	ErrBadSKAEmissionScriptFormat = ErrorKind("ErrBadSKAEmissionScriptFormat")
 
+	// ErrInvalidSKAEmission indicates that a block violates the SKA emission
+	// rules that do not depend on the emission state of the current chain.
+	ErrInvalidSKAEmission = ErrorKind("ErrInvalidSKAEmission")
+
 	// ErrBadStakebaseAmountIn indicates that the AmountIn (=subsidy) for a
 	// stakebase input was incorrect.
 	ErrBadStakebaseAmountIn = ErrorKind("ErrBadStakebaseAmountIn")

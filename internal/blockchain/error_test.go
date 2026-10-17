@@ -63,6 +63,7 @@ func TestErrorKindStringer(t *testing.T) {
 		{ErrBadSKAEmissionOutpoint, "ErrBadSKAEmissionOutpoint"},
 		{ErrBadSKAEmissionFraudProof, "ErrBadSKAEmissionFraudProof"},
 		{ErrBadSKAEmissionScriptFormat, "ErrBadSKAEmissionScriptFormat"},
+		{ErrInvalidSKAEmission, "ErrInvalidSKAEmission"},
 		{ErrBadStakebaseAmountIn, "ErrBadStakebaseAmountIn"},
 		{ErrBadStakebaseScriptLen, "ErrBadStakebaseScriptLen"},
 		{ErrBadStakebaseScrVal, "ErrBadStakebaseScrVal"},

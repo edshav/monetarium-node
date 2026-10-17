@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -85,6 +86,22 @@ func (b *BlockChain) HasVotePassedAtHeight(voteID string, blockHeight int64) boo
 	}
 
 	return b.hasVotePassed(voteID, node)
+}
+
+// skaEmissionStateError describes an SKA emission that conflicts with the
+// recorded emission state, such as an unexpected nonce or an emitted coin type.
+type skaEmissionStateError string
+
+// Error satisfies the error interface.
+func (e skaEmissionStateError) Error() string {
+	return string(e)
+}
+
+// isSKAEmissionStateError returns whether err is or wraps a
+// skaEmissionStateError.
+func isSKAEmissionStateError(err error) bool {
+	var stateErr skaEmissionStateError
+	return errors.As(err, &stateErr)
 }
 
 // CheckSKAEmissionAlreadyExists checks if a coin type has already been emitted
@@ -352,9 +369,16 @@ func ValidateAuthorizedSKAEmissionTransaction(tx *wire.MsgTx, blockHeight int64,
 		return fmt.Errorf("invalid emission authorization: %w", err)
 	}
 
-	// Validate authorization against chain parameters
-	if err := validateEmissionAuthorization(auth, chain, chainParams); err != nil {
-		return fmt.Errorf("emission authorization validation failed: %w", err)
+	// Validate authorization against chain parameters.  A conflict with the
+	// recorded emission state is only reported once every other check has
+	// passed.
+	stateErr := validateEmissionAuthorization(auth, chain, chainParams)
+	if stateErr != nil {
+		stateErr = fmt.Errorf("emission authorization validation failed: %w",
+			stateErr)
+		if !isSKAEmissionStateError(stateErr) {
+			return stateErr
+		}
 	}
 
 	// CRITICAL Verify the cryptographic signature
@@ -523,7 +547,7 @@ func ValidateAuthorizedSKAEmissionTransaction(tx *wire.MsgTx, blockHeight int64,
 	// The nonce will be updated when the block is successfully connected to the chain
 	// in CheckSKAEmissionInBlock to ensure replay protection only after commitment.
 
-	return nil
+	return stateErr
 }
 
 // verifyEmissionSignature verifies the cryptographic signature of an emission transaction.
@@ -734,7 +758,8 @@ func validateEmissionAuthorization(auth *chaincfg.SKAEmissionAuth, chain ChainSt
 	currentNonce := chain.GetSKAEmissionNonce(auth.CoinType)
 	expectedNonce := currentNonce + 1
 	if auth.Nonce != expectedNonce {
-		return fmt.Errorf("invalid nonce: expected %d, got %d", expectedNonce, auth.Nonce)
+		return skaEmissionStateError(fmt.Sprintf("invalid nonce: expected %d, "+
+			"got %d", expectedNonce, auth.Nonce))
 	}
 
 	return nil
@@ -766,6 +791,10 @@ func CheckSKAEmissionInBlock(block *dcrutil.Block, prevNode *blockNode,
 	var skaTxCount int
 	emissionTxCoinTypes := make(map[cointype.CoinType]bool)
 
+	// A conflict with the recorded emission state is only reported once every
+	// other check has passed.
+	var stateErr error
+
 	// Check all transactions in the block
 	for i, tx := range block.Transactions() {
 		msgTx := tx.MsgTx()
@@ -776,7 +805,13 @@ func CheckSKAEmissionInBlock(block *dcrutil.Block, prevNode *blockNode,
 
 			// Validate the emission transaction with full cryptographic authorization
 			if err := ValidateAuthorizedSKAEmissionTransaction(msgTx, blockHeight, chain, chainParams); err != nil {
-				return fmt.Errorf("invalid SKA emission transaction at index %d: %w", i, err)
+				err = fmt.Errorf("invalid SKA emission transaction at index %d: %w", i, err)
+				if !isSKAEmissionStateError(err) {
+					return err
+				}
+				if stateErr == nil {
+					stateErr = err
+				}
 			}
 
 			// Note: Nonce update is handled separately during actual block connection
@@ -805,8 +840,10 @@ func CheckSKAEmissionInBlock(block *dcrutil.Block, prevNode *blockNode,
 
 				// Check if this coin type has already been emitted in previous blocks
 				// This uses the blockchain state for O(1) lookups and proper reorg handling
-				if CheckSKAEmissionAlreadyExists(coinType, chain) {
-					return fmt.Errorf("SKA coin type %d has already been emitted - only one emission per coin type allowed", coinType)
+				if CheckSKAEmissionAlreadyExists(coinType, chain) && stateErr == nil {
+					stateErr = skaEmissionStateError(fmt.Sprintf("SKA coin type %d "+
+						"has already been emitted - only one emission per coin "+
+						"type allowed", coinType))
 				}
 
 				emissionTxCoinTypes[coinType] = true
@@ -869,7 +906,7 @@ func CheckSKAEmissionInBlock(block *dcrutil.Block, prevNode *blockNode,
 		}
 	}
 
-	return nil
+	return stateErr
 }
 
 // extractSKAEmissionsFromBlock extracts all SKA emission records from a block.
