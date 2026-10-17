@@ -2553,7 +2553,7 @@ func getSSFeeType(tx *wire.MsgTx) (string, error) {
 //   - Null input: Has ValueIn set to fee amount, creates new UTXO
 //   - Real input: References existing UTXO, augments it with fee
 //
-// - Outputs: Distribution to stakers (for staker SSFee) or miner (for miner SSFee)
+// - Outputs: One payment output (to a consolidation address or the miner) plus OP_RETURN outputs
 // - OP_RETURN marker: Contains "SF" for staker fees or "MF" for miner fees
 // - Coin Type: All outputs must be the same coin type
 //
@@ -2561,7 +2561,9 @@ func getSSFeeType(tx *wire.MsgTx) (string, error) {
 // - Each SSFee tx distributes fees for exactly one coin type
 // - For null input SSFee: output value == expected fee
 // - For augmented SSFee: output value == input value + expected fee
+// - Each SSFee pays a single output that is not OP_RETURN
 // - Staker SSFee (SF) can distribute any coin type including VAR
+// - Staker SSFee (SF) pays the consolidation script of a voter
 // - Miner SSFee (MF) distributes non-VAR only (VAR miner fees go to coinbase)
 // - All coin types with staker fees have corresponding SSFee transactions
 // - All non-VAR coin types with miner fees have corresponding SSFee transactions
@@ -2688,15 +2690,22 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			return ruleError(ErrStakeFees, err.Error())
 		}
 
-		// Get the coin type from the first non-OP_RETURN output
+		// An SSFee pays a single output, which is not OP_RETURN, and takes
+		// its coin type from it.
 		var coinType cointype.CoinType
+		var numPayments int
 		for _, out := range ssFeeTx.TxOut {
 			// Skip OP_RETURN outputs
 			if len(out.PkScript) > 0 && out.PkScript[0] == txscript.OP_RETURN {
 				continue
 			}
 			coinType = out.CoinType
-			break
+			numPayments++
+		}
+		if numPayments != 1 {
+			return ruleError(ErrStakeFees,
+				fmt.Sprintf("SSFee transaction has %d payment outputs, "+
+					"expected 1", numPayments))
 		}
 
 		// Determine if this is null-input (creating new) or augmented (reusing UTXO)
@@ -2816,8 +2825,8 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			// NOTE: With batched consolidation, we create ONE SSFee per unique consolidation
 			// address per coin type. Multiple voters with same address share one SSFee.
 
-			// Extract recipient hash160 from first payment output
-			// SKA uses bigint for totals, VAR uses int64
+			// Extract recipient hash160 from the payment output
+			// SKA uses bigint, VAR uses int64
 			var recipientHash160 []byte
 			var totalOutputValue int64
 			var totalOutputValueSKA *big.Int
@@ -2831,14 +2840,19 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 					continue
 				}
 
-				// Extract hash160 from payment output for consolidation address verification
-				if recipientHash160 == nil {
-					var err error
-					recipientHash160, err = extractHash160FromPkScript(out.PkScript)
-					if err != nil {
-						return ruleError(ErrStakeFees,
-							fmt.Sprintf("invalid SSFee payment script: %v", err))
-					}
+				recipientHash160, err = extractHash160FromPkScript(out.PkScript)
+				if err != nil {
+					return ruleError(ErrStakeFees,
+						fmt.Sprintf("invalid SSFee payment script: %v", err))
+				}
+
+				// The payment must use the consolidation script of its
+				// recipient.  The hash160 is 20 bytes, so this cannot fail.
+				payScript, _ := stake.ConsolidationAddrToPkScript(recipientHash160)
+				if out.Version != 0 || !bytes.Equal(out.PkScript, payScript) {
+					return ruleError(ErrStakeFees,
+						fmt.Sprintf("staker SSFee payment script is not the "+
+							"consolidation script of %x", recipientHash160))
 				}
 
 				// Get the output value based on coin type
@@ -2865,19 +2879,17 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			}
 
 			// Verify recipient matches at least one voter's consolidation address
-			if recipientHash160 != nil {
-				validRecipient := false
-				for _, voterHash160 := range voterConsolidation {
-					if bytes.Equal(recipientHash160, voterHash160) {
-						validRecipient = true
-						break
-					}
+			validRecipient := false
+			for _, voterHash160 := range voterConsolidation {
+				if bytes.Equal(recipientHash160, voterHash160) {
+					validRecipient = true
+					break
 				}
-				if !validRecipient {
-					return ruleError(ErrStakeFees,
-						fmt.Sprintf("SSFee recipient %x does not match any voter consolidation address",
-							recipientHash160))
-				}
+			}
+			if !validRecipient {
+				return ruleError(ErrStakeFees,
+					fmt.Sprintf("SSFee recipient %x does not match any voter consolidation address",
+						recipientHash160))
 			}
 
 			// Calculate the fee distributed by this SSFee transaction
@@ -2931,20 +2943,18 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			}
 
 			// Track per-consolidation-address distribution for detailed validation
-			if recipientHash160 != nil {
-				distKey := makeDistributionKey(coinType, hex.EncodeToString(recipientHash160))
-				if coinType.IsSKA() {
-					// Track SKA distribution using bigint
-					existing := actualDistributionSKA[distKey]
-					if existing == nil {
-						actualDistributionSKA[distKey] = new(big.Int).Set(thisFeeSKA)
-					} else {
-						actualDistributionSKA[distKey] = new(big.Int).Add(existing, thisFeeSKA)
-					}
+			distKey := makeDistributionKey(coinType, hex.EncodeToString(recipientHash160))
+			if coinType.IsSKA() {
+				// Track SKA distribution using bigint
+				existing := actualDistributionSKA[distKey]
+				if existing == nil {
+					actualDistributionSKA[distKey] = new(big.Int).Set(thisFeeSKA)
 				} else {
-					// Track VAR distribution using int64
-					actualDistribution[distKey] = addInt64Safe(actualDistribution[distKey], thisFee)
+					actualDistributionSKA[distKey] = new(big.Int).Add(existing, thisFeeSKA)
 				}
+			} else {
+				// Track VAR distribution using int64
+				actualDistribution[distKey] = addInt64Safe(actualDistribution[distKey], thisFee)
 			}
 		}
 	}
