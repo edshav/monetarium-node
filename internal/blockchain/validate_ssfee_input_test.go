@@ -223,6 +223,17 @@ func TestCheckTransactionInputsRejectsInvalidAugmentedSSFee(t *testing.T) {
 			want: ErrBadSSFeeInput,
 		},
 		{
+			// The maturity exemption covers only OP_SSGEN tagged outputs,
+			// and a miner SSFee may pay to any script.
+			name: "spends an immature OP_SSRTX tagged SSFee output",
+			mutate: func(prev *ssFeeTestOutput, tx *wire.MsgTx) {
+				script := append([]byte{txscript.OP_SSRTX}, ssFeeScript[1:]...)
+				prev.entry.pkScript = script
+				tx.TxOut[1].PkScript = script
+			},
+			want: ErrImmatureSpend,
+		},
+		{
 			name: "fraud proof with a wrong block height",
 			mutate: func(_ *ssFeeTestOutput, tx *wire.MsgTx) {
 				tx.TxIn[0].BlockHeight++

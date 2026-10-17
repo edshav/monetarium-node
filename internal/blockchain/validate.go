@@ -4327,7 +4327,9 @@ func CheckTransactionInputs(subsidyCache *standalone.SubsidyCache,
 			// maturity because the resulting output will also require maturity
 			// before being spent by any other transaction.
 			isAugmentedSSFee := isSSFee &&
-				utxoEntry.TransactionType() == stake.TxTypeSSFee
+				utxoEntry.TransactionType() == stake.TxTypeSSFee &&
+				stake.IsVoteScript(utxoEntry.ScriptVersion(),
+					utxoEntry.PkScript())
 
 			// Apply maturity check unless this is an augmented SSFee
 			if !isAugmentedSSFee {
