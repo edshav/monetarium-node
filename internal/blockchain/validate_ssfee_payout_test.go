@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"encoding/hex"
+	"errors"
 	"math/big"
 	"sort"
 	"testing"
@@ -107,6 +108,34 @@ func stakerSSFeeTestTxns(t *testing.T, coinType cointype.CoinType,
 	return txns
 }
 
+// ssFeeTestLayout returns votes of the given consolidation addresses, the fees
+// of a block that pays fee of the given coin type, and SSFee transactions that
+// distribute them as the block template generator does: one staker SSFee per
+// address in sorted order, then for SKA a miner SSFee paying minerScript.
+func ssFeeTestLayout(t *testing.T, coinType cointype.CoinType, addrs [][]byte,
+	fee int64, minerScript []byte) ([]*dcrutil.Tx, []*wire.MsgTx, wire.FeesByType) {
+
+	t.Helper()
+	votes := make([]*dcrutil.Tx, 0, len(addrs))
+	for _, addr := range addrs {
+		votes = append(votes, ssFeeTestVote(t, addr))
+	}
+	fees := wire.NewFeesByType()
+	fees.AddBig(coinType, big.NewInt(fee))
+	work, stakeShare, _, _ := standalone.GetSubsidyProportions(
+		standalone.SSVMonetarium)
+	minerFees, stakerFees := wire.CalcFeeSplitByCoinType(fees, work, stakeShare)
+
+	ssFeeTxns := stakerSSFeeTestTxns(t, coinType, votes,
+		stakerFees.GetBig(coinType))
+	if coinType.IsSKA() {
+		ssFeeTxns = append(ssFeeTxns, ssFeeTestTx(coinType,
+			stake.CreateMinerSSFeeMarker(200), minerScript,
+			minerFees.GetBig(coinType)))
+	}
+	return votes, ssFeeTxns, fees
+}
+
 // TestSSFeeAcceptsTemplatePayouts ensures SSFee transactions laid out as the
 // block template generator does, one payout each, distribute the fees of a
 // block with one vote and with votes of several consolidation addresses, with
@@ -120,8 +149,6 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	work, stakeShare, _, _ := standalone.GetSubsidyProportions(
-		standalone.SSVMonetarium)
 
 	tests := []struct {
 		name        string
@@ -172,26 +199,12 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			votes := make([]*dcrutil.Tx, 0, len(test.votes))
-			for _, addr := range test.votes {
-				votes = append(votes, ssFeeTestVote(t, addr))
+			payScript := minerScript
+			if test.minerScript != nil {
+				payScript = test.minerScript
 			}
-			fees := wire.NewFeesByType()
-			fees.AddBig(test.coinType, big.NewInt(test.fee))
-			minerFees, stakerFees := wire.CalcFeeSplitByCoinType(fees, work,
-				stakeShare)
-
-			ssFeeTxns := stakerSSFeeTestTxns(t, test.coinType, votes,
-				stakerFees.GetBig(test.coinType))
-			if test.coinType.IsSKA() {
-				payScript := minerScript
-				if test.minerScript != nil {
-					payScript = test.minerScript
-				}
-				ssFeeTxns = append(ssFeeTxns, ssFeeTestTx(test.coinType,
-					stake.CreateMinerSSFeeMarker(200), payScript,
-					minerFees.GetBig(test.coinType)))
-			}
+			votes, ssFeeTxns, fees := ssFeeTestLayout(t, test.coinType,
+				test.votes, test.fee, payScript)
 
 			// Make each SSFee add its fee to an earlier output, as the
 			// template generator does when it finds one.
@@ -220,6 +233,128 @@ func TestSSFeeAcceptsTemplatePayouts(t *testing.T) {
 				ssFeeTxns, fees, standalone.SSVMonetarium)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+// splitSSFeePayout moves one atom of the payment output of the SSFee to a
+// second output with the same script.
+func splitSSFeePayout(tx *wire.MsgTx) {
+	payOut := tx.TxOut[1]
+	second := *payOut
+	if payOut.CoinType.IsSKA() {
+		payOut.SKAValue = new(big.Int).Sub(payOut.SKAValue, big.NewInt(1))
+		second.SKAValue = big.NewInt(1)
+	} else {
+		payOut.Value--
+		second.Value = 1
+	}
+	tx.AddTxOut(&second)
+}
+
+// TestSSFeeRejectsPayoutLayouts ensures SSFee transactions that differ from an
+// accepted layout only in their payment outputs are rejected: a staker or miner
+// SSFee without a payment output or with two, and a staker payout to its
+// recipient with a script version or a script other than the consolidation
+// script of that recipient.
+func TestSSFeeRejectsPayoutLayouts(t *testing.T) {
+	addrA := []byte{1: 0xaa, 19: 0x01}
+	addrB := []byte{1: 0xbb, 19: 0x02}
+	addrC := []byte{1: 0xcc, 19: 0x03}
+	minerScript, err := stake.ConsolidationAddrToPkScript(addrC)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The layout pays addrA in ssFeeTxns[0] and addrB in ssFeeTxns[1], then
+	// for SKA the miner in ssFeeTxns[2].  Each SSFee has the marker at output
+	// 0 and the payment at output 1.
+	tests := []struct {
+		name     string
+		coinType cointype.CoinType
+		munge    func([]*wire.MsgTx) []*wire.MsgTx
+	}{{
+		name:     "staker SSFee without a payment output",
+		coinType: cointype.CoinTypeVAR,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			txns[1].TxOut = txns[1].TxOut[:1]
+			return txns
+		},
+	}, {
+		// Without a payment output the SSFee is taken as VAR, whose miner
+		// share in an SKA1-only block is zero.
+		name:     "extra miner SSFee without a payment output",
+		coinType: 1,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			tx := ssFeeTestTx(1, stake.CreateMinerSSFeeMarker(200), nil,
+				nil)
+			tx.TxOut = tx.TxOut[:1]
+			return append(txns, tx)
+		},
+	}, {
+		name:     "staker SSFee with two payment outputs",
+		coinType: cointype.CoinTypeVAR,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			splitSSFeePayout(txns[1])
+			return txns
+		},
+	}, {
+		name:     "miner SSFee with two payment outputs",
+		coinType: 1,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			splitSSFeePayout(txns[2])
+			return txns
+		},
+	}, {
+		name:     "staker payout with script version 1",
+		coinType: 1,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			txns[1].TxOut[1].Version = 1
+			return txns
+		},
+	}, {
+		name:     "staker payout as P2PKH without the OP_SSGEN tag",
+		coinType: cointype.CoinTypeVAR,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			txns[1].TxOut[1].PkScript = txns[1].TxOut[1].PkScript[1:]
+			return txns
+		},
+	}, {
+		name:     "staker payout as P2SH of the recipient hash",
+		coinType: cointype.CoinTypeVAR,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			script := []byte{txscript.OP_HASH160, txscript.OP_DATA_20}
+			script = append(script, addrB...)
+			txns[1].TxOut[1].PkScript = append(script, txscript.OP_EQUAL)
+			return txns
+		},
+	}, {
+		name:     "staker payout with a tagged script ending in OP_TRUE",
+		coinType: cointype.CoinTypeVAR,
+		munge: func(txns []*wire.MsgTx) []*wire.MsgTx {
+			payOut := txns[1].TxOut[1]
+			script := append([]byte(nil), payOut.PkScript...)
+			script[len(script)-1] = txscript.OP_TRUE
+			payOut.PkScript = script
+			return txns
+		},
+	}}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fee := int64(2_007)
+			if test.coinType.IsSKA() {
+				fee = 1_000_000_000_000_000_007
+			}
+			votes, ssFeeTxns, fees := ssFeeTestLayout(t, test.coinType,
+				[][]byte{addrA, addrB, addrA}, fee, minerScript)
+			ssFeeTxns = test.munge(ssFeeTxns)
+
+			err := (&BlockChain{}).validateSSFeeTxns(nil, nil, votes,
+				ssFeeTxns, fees, standalone.SSVMonetarium)
+			if !errors.Is(err, ErrStakeFees) {
+				t.Fatalf("got error %v, want %v", err, ErrStakeFees)
 			}
 		})
 	}
