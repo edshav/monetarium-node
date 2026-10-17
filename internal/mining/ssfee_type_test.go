@@ -6,6 +6,7 @@ package mining
 
 import (
 	"bytes"
+	"errors"
 	"math/big"
 	"testing"
 
@@ -62,20 +63,59 @@ func TestIsSSFeeOutputOfType(t *testing.T) {
 		outpoint wire.OutPoint
 		index    uint32
 		feeType  string
+		want     bool
 	}{{
 		name:     "staker SSFee at a height that reads MF",
 		outpoint: wire.OutPoint{Hash: staker.TxHash(), Index: 1, Tree: wire.TxTreeStake},
 		index:    0,
 		feeType:  "SF",
+		want:     true,
 	}, {
 		name:     "miner SSFee with the marker last",
 		outpoint: wire.OutPoint{Hash: miner.TxHash(), Index: 0, Tree: wire.TxTreeStake},
 		index:    1,
 		feeType:  "MF",
+		want:     true,
+	}, {
+		name:     "wrong expected type",
+		outpoint: wire.OutPoint{Hash: staker.TxHash(), Index: 1, Tree: wire.TxTreeStake},
+		index:    0,
+		feeType:  "MF",
+		want:     false,
+	}, {
+		name:     "wrong transaction hash",
+		outpoint: wire.OutPoint{Hash: staker.TxHash(), Index: 0, Tree: wire.TxTreeStake},
+		index:    1,
+		feeType:  "MF",
+		want:     false,
+	}, {
+		name:     "out of range transaction index",
+		outpoint: wire.OutPoint{Hash: staker.TxHash(), Index: 1, Tree: wire.TxTreeStake},
+		index:    2,
+		feeType:  "SF",
+		want:     false,
 	}}
 	for _, test := range tests {
-		if !g.isSSFeeOutputOfType(&test.outpoint, height, test.index, test.feeType) {
-			t.Errorf("%s: output not recognised as %s", test.name, test.feeType)
+		got := g.isSSFeeOutputOfType(&test.outpoint, height, test.index, test.feeType)
+		if got != test.want {
+			t.Errorf("%s: output recognised as %s, want %v", test.name,
+				test.feeType, test.want)
+		}
+	}
+
+	// The type is not confirmed without the block that holds the transaction.
+	outpoint := wire.OutPoint{Hash: staker.TxHash(), Index: 1, Tree: wire.TxTreeStake}
+	noBlock := &BlkTmplGenerator{cfg: &Config{
+		BlockByHeight: func(int64) (*dcrutil.Block, error) {
+			return nil, errors.New("block not found")
+		},
+	}}
+	for name, g := range map[string]*BlkTmplGenerator{
+		"block fetch fails": noBlock,
+		"nil generator":     nil,
+	} {
+		if g.isSSFeeOutputOfType(&outpoint, height, 0, "SF") {
+			t.Errorf("%s: output recognised as SF", name)
 		}
 	}
 }
