@@ -6,6 +6,7 @@ package blockchain
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"testing"
 
@@ -36,7 +37,8 @@ type txInTestOutput struct {
 // checkTxInTest runs CheckTransactionInputs on testnet, where SKA1 and SKA2
 // are active, for a transaction spending the given outputs and paying the
 // given outputs.
-func checkTxInTest(t *testing.T, spends []txInTestOutput, outs []*wire.TxOut) error {
+func checkTxInTest(t *testing.T, spends []txInTestOutput, outs []*wire.TxOut,
+	checkFraudProof bool) error {
 	t.Helper()
 
 	params := chaincfg.TestNet3Params()
@@ -62,7 +64,7 @@ func checkTxInTest(t *testing.T, spends []txInTestOutput, outs []*wire.TxOut) er
 	tx.TxOut = outs
 
 	_, err := CheckTransactionInputs(standalone.NewSubsidyCache(params),
-		dcrutil.NewTx(tx), 200, view, true, params, nil, false, false,
+		dcrutil.NewTx(tx), 200, view, checkFraudProof, params, nil, false, false,
 		standalone.SSVMonetarium)
 	return err
 }
@@ -77,14 +79,27 @@ func TestTxInputValueFields(t *testing.T) {
 		PkScript: txInTestScript}}
 
 	tests := []struct {
-		name   string
-		spends []txInTestOutput
-		outs   []*wire.TxOut
-		want   error
+		name           string
+		spends         []txInTestOutput
+		outs           []*wire.TxOut
+		skipFraudProof bool
+		want           error
 	}{{
 		name:   "VAR input with matching values",
 		spends: []txInTestOutput{{amount: 1000, valueIn: 1000}},
 		outs:   varOut,
+	}, {
+		// A block template is checked before its fraud proofs are filled in.
+		name: "VAR input with wrong values without the fraud proof check",
+		spends: []txInTestOutput{{amount: 1000, valueIn: 999,
+			skaValueIn: big.NewInt(1)}},
+		outs:           varOut,
+		skipFraudProof: true,
+	}, {
+		name: "VAR input with a zero SKA value",
+		spends: []txInTestOutput{{amount: 1000, valueIn: 1000,
+			skaValueIn: new(big.Int)}},
+		outs: varOut,
 	}, {
 		name: "VAR input with an SKA value",
 		spends: []txInTestOutput{{amount: 1000, valueIn: 1000,
@@ -96,6 +111,17 @@ func TestTxInputValueFields(t *testing.T) {
 		spends: []txInTestOutput{{coinType: 1, skaAmount: ska,
 			skaValueIn: ska}},
 		outs: skaOut,
+	}, {
+		name: "SKA input with a different SKA value",
+		spends: []txInTestOutput{{coinType: 1, skaAmount: ska,
+			skaValueIn: new(big.Int).Sub(ska, big.NewInt(1))}},
+		outs: skaOut,
+		want: ErrFraudAmountIn,
+	}, {
+		name:   "SKA input without an SKA value",
+		spends: []txInTestOutput{{coinType: 1, skaAmount: ska}},
+		outs:   skaOut,
+		want:   ErrFraudAmountIn,
 	}, {
 		name: "SKA input with an atom value",
 		spends: []txInTestOutput{{coinType: 1, skaAmount: ska, valueIn: 1,
@@ -112,7 +138,8 @@ func TestTxInputValueFields(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := checkTxInTest(t, test.spends, test.outs)
+			err := checkTxInTest(t, test.spends, test.outs,
+				!test.skipFraudProof)
 			if !errors.Is(err, test.want) {
 				t.Fatalf("got error %v, want %v", err, test.want)
 			}
@@ -121,7 +148,8 @@ func TestTxInputValueFields(t *testing.T) {
 }
 
 // TestTxInputCoinType ensures every input of a transaction must spend an
-// output of the coin type of the transaction.
+// output of the coin type of the transaction, also when the fraud proof is not
+// checked, as for a block template.
 func TestTxInputCoinType(t *testing.T) {
 	ska1, ska2 := big.NewInt(110), big.NewInt(1_000_000)
 	varOut := []*wire.TxOut{{Value: 900, PkScript: txInTestScript}}
@@ -147,6 +175,12 @@ func TestTxInputCoinType(t *testing.T) {
 		outs: ska1Out,
 		want: ErrInputCoinTypeMismatch,
 	}, {
+		name: "only an SKA2 input in an SKA1 transaction",
+		spends: []txInTestOutput{{coinType: 2, skaAmount: ska2,
+			skaValueIn: ska2}},
+		outs: ska1Out,
+		want: ErrInputCoinTypeMismatch,
+	}, {
 		name: "VAR input in an SKA1 transaction",
 		spends: []txInTestOutput{{coinType: 1, skaAmount: ska1,
 			skaValueIn: ska1}, {amount: 1000, valueIn: 1000}},
@@ -161,11 +195,62 @@ func TestTxInputCoinType(t *testing.T) {
 	}}
 
 	for _, test := range tests {
+		for _, checkFraudProof := range []bool{true, false} {
+			name := fmt.Sprintf("%s (fraud proof %v)", test.name,
+				checkFraudProof)
+			t.Run(name, func(t *testing.T) {
+				err := checkTxInTest(t, test.spends, test.outs,
+					checkFraudProof)
+				if !errors.Is(err, test.want) {
+					t.Fatalf("got error %v, want %v", err, test.want)
+				}
+			})
+		}
+	}
+}
+
+// TestTxInputRulesRejectBlock ensures a block is rejected when one of its
+// transactions breaks either input rule, so the rules apply when blocks are
+// connected and not only when CheckTransactionInputs is called directly.
+func TestTxInputRulesRejectBlock(t *testing.T) {
+	// Regnet has no active SKA coin type, so take SKA1 from simnet.
+	params := chaincfg.RegNetParams()
+	params.SKACoins = map[cointype.CoinType]*chaincfg.SKACoinConfig{
+		1: chaincfg.SimNetParams().SKACoins[1],
+	}
+	g := newChaingenHarness(t, params)
+	g.AdvanceToStakeValidationHeight()
+	baseName := g.TipName()
+
+	tests := []struct {
+		name  string
+		munge func(*wire.MsgTx)
+		want  ErrorKind
+	}{{
+		name: "SKA value on a VAR input",
+		munge: func(tx *wire.MsgTx) {
+			tx.TxIn[0].SKAValueIn = big.NewInt(1)
+		},
+		want: ErrFraudAmountIn,
+	}, {
+		name: "VAR input in an SKA1 transaction",
+		munge: func(tx *wire.MsgTx) {
+			tx.TxOut[0].CoinType = 1
+			tx.TxOut[0].SKAValue = big.NewInt(tx.TxOut[0].Value)
+			tx.TxOut[0].Value = 0
+		},
+		want: ErrInputCoinTypeMismatch,
+	}}
+
+	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := checkTxInTest(t, test.spends, test.outs)
-			if !errors.Is(err, test.want) {
-				t.Fatalf("got error %v, want %v", err, test.want)
-			}
+			g.SetTip(baseName)
+			outs := g.OldestCoinbaseOuts()
+			g.NextBlock(fmt.Sprintf("bbadin%d", i), &outs[0], outs[1:],
+				func(b *wire.MsgBlock) {
+					test.munge(b.Transactions[1])
+				})
+			g.RejectTipBlock(test.want)
 		})
 	}
 }

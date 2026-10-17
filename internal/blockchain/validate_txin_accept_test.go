@@ -61,7 +61,7 @@ func TestTxInputRulesAcceptRegular(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if err := checkTxInTest(t, test.spends, test.outs); err != nil {
+			if err := checkTxInTest(t, test.spends, test.outs, true); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
