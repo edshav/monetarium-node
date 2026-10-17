@@ -181,6 +181,7 @@ func TestCheckTransactionInputsRejectsInvalidAugmentedSSFee(t *testing.T) {
 	params := chaincfg.SimNetParams()
 	subsidyCache := standalone.NewSubsidyCache(params)
 	const originHeight = 1000
+	const ska1 = cointype.CoinType(1)
 
 	ssFeeScript, err := stake.ConsolidationAddrToPkScript(bytes.Repeat([]byte{0x11}, 20))
 	if err != nil {
@@ -232,6 +233,28 @@ func TestCheckTransactionInputsRejectsInvalidAugmentedSSFee(t *testing.T) {
 				tx.TxOut[1].PkScript = script
 			},
 			want: ErrImmatureSpend,
+		},
+		{
+			// The output pays to the same script, so only the coin type
+			// check rejects the spend.
+			name: "SKA SSFee spends a VAR SSFee output",
+			mutate: func(_ *ssFeeTestOutput, tx *wire.MsgTx) {
+				for i, txOut := range tx.TxOut {
+					tx.TxOut[i] = newTestTxOut(ska1, txOut.Value,
+						txOut.PkScript)
+				}
+			},
+			want: ErrInputCoinTypeMismatch,
+		},
+		{
+			name: "VAR SSFee spends an SKA SSFee output",
+			mutate: func(prev *ssFeeTestOutput, tx *wire.MsgTx) {
+				prev.entry.coinType = ska1
+				prev.entry.skaAmount = big.NewInt(prev.entry.amount)
+				prev.entry.amount = 0
+				*tx.TxIn[0] = *prev.spendingTxIn()
+			},
+			want: ErrInputCoinTypeMismatch,
 		},
 		{
 			name: "fraud proof with a wrong block height",
