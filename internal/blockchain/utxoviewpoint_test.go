@@ -533,6 +533,11 @@ func TestAddRegularInputUtxosOnlyReferenced(t *testing.T) {
 //     followed by reinclusion of the first transaction, reconstruction of
 //     the zero conf spend chain, and a reorganization away from and back
 //     to that branch
+//   - Rejection of a disapproving block that spends an output of the
+//     disapproved regular transaction tree without reincluding its creating
+//     transaction
+//   - Rejection of a disapproving block that reincludes a transaction after
+//     the transaction that spends its output
 func testDisapprovalScenarios(t *testing.T, flushUtxoCache bool) {
 	// Create a test harness initialized with the genesis block as the tip and
 	// advance it to stake validation height.
@@ -1006,6 +1011,107 @@ func testDisapprovalScenarios(t *testing.T, flushUtxoCache bool) {
 		g.ExpectUtxoUnspendable(outpoint(txE, 0))
 		g.ExpectUtxoUnspendable(outpoint(txF, 0))
 		g.ExpectUtxoSpendable(outpoint(txG, 0))
+	}
+
+	// -------------------------------------------------------------------------
+	// Create a block with two regular transactions where the second transaction
+	// spends an output from the first transaction as a zero conf spend,
+	// followed by a block that disapproves the regular tx tree of the previous
+	// block and spends the output of the first transaction without reincluding
+	// it.
+	//
+	// The disapproval removes the outputs of both transactions, so the block
+	// must be rejected without changing the utxo set.  A block that reincludes
+	// the first transaction before spending the same output must then be
+	// accepted.
+	//
+	//   ... -> s9b0 -> s9b1bad (disapproves s9b0, rejected)
+	//              \-> s9b1    (disapproves s9b0)
+	//
+	// s9b0:    txA (spends a coinbase output) -> txB (zero conf spend of txA)
+	// s9b1bad: spends the output of txA without reincluding txA
+	// s9b1:    txA (reincluded from s9b0) -> txC (zero conf spend of txA)
+	// -------------------------------------------------------------------------
+	{
+		outs := g.OldestCoinbaseOuts()
+		b0 := g.NextBlock("s9b0", &outs[0], outs[1:], addZeroConfSpend(1, 0))
+		g.AcceptTipBlock()
+		txA := b0.Transactions[1]
+		txB := b0.Transactions[2]
+
+		outs = g.OldestCoinbaseOuts()
+		txAOut := chaingen.MakeSpendableOut(b0, 1, 0)
+		g.NextBlock("s9b1bad", &txAOut, outs[1:], disapproveParent)
+		g.AssertTipDisapprovesPrevious()
+		g.RejectTipBlock(ErrMissingTxOut)
+		g.ExpectTip("s9b0")
+		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
+		g.ExpectUtxoUnspendable(outpoint(txA, 0))
+		g.ExpectUtxoSpendable(outpoint(txB, 0))
+
+		g.SetTip("s9b0")
+		b1 := g.NextBlock("s9b1", nil, outs[1:], disapproveParent, addTx(txA),
+			addZeroConfSpend(1, 0))
+		g.AssertTipDisapprovesPrevious()
+		g.AcceptTipBlock()
+		g.ExpectTip("s9b1")
+		txC := b1.Transactions[2]
+		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
+		g.ExpectUtxoUnspendable(outpoint(txA, 0))
+		g.ExpectUtxoUnspendable(outpoint(txB, 0))
+		g.ExpectUtxoSpendable(outpoint(txC, 0))
+	}
+
+	// -------------------------------------------------------------------------
+	// Create a block with a regular transaction that spends a coinbase output,
+	// followed by a block that disapproves the regular tx tree of the previous
+	// block and reincludes that transaction after a transaction that spends its
+	// output.
+	//
+	// A transaction may only spend outputs of transactions earlier in the
+	// regular tree, so the block must be rejected without changing the utxo
+	// set.  The same block with the transactions in order must then be
+	// accepted.
+	//
+	//   ... -> s10b0 -> s10b1bad (disapproves s10b0, rejected)
+	//               \-> s10b1    (disapproves s10b0)
+	//
+	// s10b0:    txA (spends a coinbase output)
+	// s10b1bad: txB (spends the output of txA) -> txA (reincluded from s10b0)
+	// s10b1:    txA (reincluded from s10b0) -> txB (zero conf spend of txA)
+	// -------------------------------------------------------------------------
+	{
+		outs := g.OldestCoinbaseOuts()
+		b0 := g.NextBlock("s10b0", &outs[0], outs[1:])
+		g.AcceptTipBlock()
+		txA := b0.Transactions[1]
+
+		// swapFirstRegularTxns is a munger that swaps the first two regular
+		// transactions after the coinbase.
+		swapFirstRegularTxns := func(b *wire.MsgBlock) {
+			b.Transactions[1], b.Transactions[2] = b.Transactions[2],
+				b.Transactions[1]
+		}
+
+		outs = g.OldestCoinbaseOuts()
+		g.NextBlock("s10b1bad", nil, outs[1:], disapproveParent, addTx(txA),
+			addZeroConfSpend(1, 0), swapFirstRegularTxns)
+		g.AssertTipDisapprovesPrevious()
+		g.RejectTipBlock(ErrMissingTxOut)
+		g.ExpectTip("s10b0")
+		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
+		g.ExpectUtxoSpendable(outpoint(txA, 0))
+
+		g.SetTip("s10b0")
+		b1 := g.NextBlock("s10b1", nil, outs[1:], disapproveParent, addTx(txA),
+			addZeroConfSpend(1, 0))
+		g.AssertTipDisapprovesPrevious()
+		g.AcceptTipBlock()
+		g.ExpectTip("s10b1")
+		txB := b1.Transactions[2]
+		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
+		g.ExpectUtxoUnspendable(outpoint(txA, 0))
+		g.ExpectUtxoSpendable(outpoint(txB, 0))
 	}
 }
 

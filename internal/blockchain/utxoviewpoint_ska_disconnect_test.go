@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/monetarium/monetarium-node/blockchain/chaingen"
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/blockchain/standalone"
 	"github.com/monetarium/monetarium-node/chaincfg"
@@ -132,15 +133,17 @@ func (h *skaDisconnectHarness) createSKASpendTx() *wire.MsgTx {
 	return tx
 }
 
-// addSKASpendTx adds spendTx to the regular tree of b along with the stake
-// tree SSFee transactions that distribute its SKA fee to the block's voters
-// and miner.
-func addSKASpendTx(b *wire.MsgBlock, spendTx *wire.MsgTx) {
-	b.AddTransaction(spendTx)
+// addSKASpendTx adds the spend transactions, each paying skaSpendFee, to the
+// regular tree of b along with the stake tree SSFee transactions that
+// distribute their SKA fees to the block's voters and miner.
+func addSKASpendTx(b *wire.MsgBlock, spendTxns ...*wire.MsgTx) {
+	for _, spendTx := range spendTxns {
+		b.AddTransaction(spendTx)
+	}
 
 	height := int64(b.Header.Height)
-	minerFee, stakerFee := standalone.CalcFeeSplit(skaSpendFee,
-		standalone.SSVMonetarium)
+	minerFee, stakerFee := standalone.CalcFeeSplit(
+		skaSpendFee*int64(len(spendTxns)), standalone.SSVMonetarium)
 
 	// newSSFeeTx returns a null-input SSFee transaction with the given marker
 	// paying amount to pkScript.
@@ -556,4 +559,142 @@ func TestDisconnectSKAEmissionInputs(t *testing.T) {
 				test.name)
 		}
 	}
+}
+
+// createSKAChildTx returns a transaction that spends the first output of the
+// SKA transaction parent, located at parentIndex in the regular tree of the
+// block at parentHeight, to a new p2sh OP_TRUE SKA output, paying skaSpendFee.
+// An SKA OP_RETURN output with a unique script gives each child its own hash.
+func (h *skaDisconnectHarness) createSKAChildTx(parent *wire.MsgTx,
+	parentHeight, parentIndex uint32) *wire.MsgTx {
+
+	scriptVer, script := h.P2shOpTrueAddr().PaymentScript()
+	value := parent.TxOut[0].SKAValue
+	tx := wire.NewMsgTx()
+	tx.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: parent.TxHash(),
+			Tree: wire.TxTreeRegular},
+		Sequence:        wire.MaxTxInSequenceNum,
+		SKAValueIn:      new(big.Int).Set(value),
+		BlockHeight:     parentHeight,
+		BlockIndex:      parentIndex,
+		SignatureScript: []byte{txscript.OP_DATA_1, txscript.OP_TRUE},
+	})
+	tx.AddTxOut(&wire.TxOut{
+		SKAValue: new(big.Int).Sub(value, big.NewInt(skaSpendFee)),
+		CoinType: 1,
+		Version:  scriptVer,
+		PkScript: script,
+	})
+	tx.AddTxOut(&wire.TxOut{
+		SKAValue: new(big.Int),
+		CoinType: 1,
+		PkScript: chaingen.UniqueOpReturnScript(),
+	})
+	return tx
+}
+
+// TestDisapprovalSKAZeroConf ensures the utxo set stays correct when a block
+// disapproves the regular tree of its parent, reincludes the SKA transaction
+// from it and spends the SKA output of that transaction as a zero conf spend,
+// and when a reorganization later approves the parent instead.  It also ensures
+// a disapproving block that spends that output without reincluding its
+// creating transaction is rejected without changing the utxo set.
+//
+// It runs with the utxo cache flushed after every block and with flushes
+// disabled.
+func TestDisapprovalSKAZeroConf(t *testing.T) {
+	const (
+		// vbDisapprovePrev and vbApprovePrev represent no and yes votes,
+		// respectively, on whether or not to approve the previous block.
+		vbDisapprovePrev = 0x0000
+		vbApprovePrev    = 0x0001
+	)
+
+	run := func(t *testing.T, flushUtxoCache bool) {
+		h := newSKADisconnectHarness(t)
+		h.advanceToEmissionMaturity()
+		h.ForceUtxoCacheFlush()
+		if !flushUtxoCache {
+			h.DisableUtxoCacheFlushes()
+		}
+
+		outpoint := func(tx *wire.MsgTx) wire.OutPoint {
+			return wire.OutPoint{Hash: tx.TxHash(), Tree: wire.TxTreeRegular}
+		}
+		disapproveParent := func(b *wire.MsgBlock) {
+			b.Header.VoteBits &^= vbApprovePrev
+			h.ReplaceVoteBits(vbDisapprovePrev)(b)
+		}
+
+		//   ... -> bskamat# -> bz0
+		//
+		// bz0: txA (spends the SKA emission)
+		txA := h.createSKASpendTx()
+		outs := h.OldestCoinbaseOuts()
+		b0 := h.NextBlock("bz0", nil, outs[1:], func(b *wire.MsgBlock) {
+			addSKASpendTx(b, txA)
+		})
+		h.AcceptTipBlock()
+		h.ExpectUtxoUnspendable(h.emitOut)
+		h.ExpectUtxoSpendable(outpoint(txA))
+
+		//   ... -> bz0 -> bz1bad (disapproves bz0, rejected)
+		//
+		// bz1bad: spends the output of txA without reincluding txA
+		outs = h.OldestCoinbaseOuts()
+		orphan := h.createSKAChildTx(txA, b0.Header.Height,
+			uint32(len(b0.Transactions)-1))
+		h.NextBlock("bz1bad", nil, outs[1:], disapproveParent,
+			func(b *wire.MsgBlock) { addSKASpendTx(b, orphan) })
+		h.AssertTipDisapprovesPrevious()
+		h.RejectTipBlock(ErrMissingTxOut)
+		h.ExpectTip("bz0")
+		h.ExpectUtxoUnspendable(h.emitOut)
+		h.ExpectUtxoSpendable(outpoint(txA))
+
+		//   ... -> bz0 -> bz1 (disapproves bz0)
+		//
+		// bz1: txA (reincluded from bz0) -> txB (zero conf spend of txA)
+		h.SetTip("bz0")
+		var txB *wire.MsgTx
+		h.NextBlock("bz1", nil, outs[1:], disapproveParent,
+			func(b *wire.MsgBlock) {
+				txB = h.createSKAChildTx(txA, b.Header.Height,
+					uint32(len(b.Transactions)))
+				addSKASpendTx(b, txA, txB)
+			})
+		h.AssertTipDisapprovesPrevious()
+		h.AcceptTipBlock()
+		h.ExpectTip("bz1")
+		h.ExpectUtxoUnspendable(h.emitOut)
+		h.ExpectUtxoUnspendable(outpoint(txA))
+		h.ExpectUtxoSpendable(outpoint(txB))
+
+		//   ... -> bz0 -> bz1 (disapproves bz0)
+		//             \-> bz1a (approves bz0) -> bz2a
+		h.SetTip("bz0")
+		h.NextBlock("bz1a", nil, outs[1:])
+		h.AcceptedToSideChainWithExpectedTip("bz1")
+		h.NextBlock("bz2a", nil, nil)
+		h.AcceptTipBlock()
+		h.ExpectTip("bz2a")
+		h.ExpectUtxoUnspendable(h.emitOut)
+		h.ExpectUtxoSpendable(outpoint(txA))
+		h.ExpectUtxoUnspendable(outpoint(txB))
+
+		entry, err := h.chain.FetchUtxoEntry(outpoint(txA))
+		if err != nil {
+			t.Fatalf("FetchUtxoEntry(%v): %v", outpoint(txA), err)
+		}
+		want := txA.TxOut[0].SKAValue
+		if entry.CoinType() != 1 || entry.SKAAmount().Cmp(want) != 0 {
+			t.Fatalf("output %v: got coin type %d, SKA amount %v, want coin "+
+				"type 1, SKA amount %v", outpoint(txA), entry.CoinType(),
+				entry.SKAAmount(), want)
+		}
+	}
+
+	t.Run("utxo cache flush enabled", func(t *testing.T) { run(t, true) })
+	t.Run("utxo cache flush disabled", func(t *testing.T) { run(t, false) })
 }
