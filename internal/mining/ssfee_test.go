@@ -5,6 +5,7 @@
 package mining
 
 import (
+	"bytes"
 	"math/big"
 	"testing"
 
@@ -587,4 +588,55 @@ func TestCreateSSFeeTxBatchedUTXOAugmentation(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestCreateSSFeeTxBatchedScriptHash ensures voters with a P2SH ("SH")
+// consolidation address are paid the OP_SSGEN-tagged P2SH script of that
+// address, in a group of their own apart from P2PKH voters of the same
+// hash160, which sort first and take the remainder.
+func TestCreateSSFeeTxBatchedScriptHash(t *testing.T) {
+	addr := bytes.Repeat([]byte{0x01}, 20)
+	p2shVoteTx := createMockVoteWithConsolidation(1000, addr).MsgTx()
+	out, err := stake.CreateSSFeeScriptHashConsolidationOutput(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2shVoteTx.TxOut[3] = out
+	p2shVote := dcrutil.NewTx(p2shVoteTx)
+	voters := []*dcrutil.Tx{p2shVote,
+		createMockVoteWithConsolidation(1000, addr), p2shVote}
+
+	p2pkhScript, _ := stake.ConsolidationAddrToPkScript(addr)
+	p2shScript, _ := stake.ConsolidationScriptHashToPkScript(addr)
+	want := []struct {
+		script []byte
+		amount int64
+	}{{p2pkhScript, 1001}, {p2shScript, 2000}}
+
+	for _, coinType := range []cointype.CoinType{cointype.CoinTypeVAR, 1} {
+		txns, err := createSSFeeTxBatched(coinType, big.NewInt(3001), voters,
+			100, nil, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("%v: unexpected error: %v", coinType, err)
+		}
+		if len(txns) != len(want) {
+			t.Fatalf("%v: got %d SSFee transactions, want %d", coinType,
+				len(txns), len(want))
+		}
+		for i, tx := range txns {
+			payOut := tx.MsgTx().TxOut[1]
+			if !bytes.Equal(payOut.PkScript, want[i].script) {
+				t.Errorf("%v: SSFee %d pays script %x, want %x", coinType, i,
+					payOut.PkScript, want[i].script)
+			}
+			amount := big.NewInt(payOut.Value)
+			if coinType.IsSKA() {
+				amount = payOut.SKAValue
+			}
+			if amount.Cmp(big.NewInt(want[i].amount)) != 0 {
+				t.Errorf("%v: SSFee %d pays %v, want %d", coinType, i, amount,
+					want[i].amount)
+			}
+		}
+	}
 }
