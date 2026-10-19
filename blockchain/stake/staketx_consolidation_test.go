@@ -66,6 +66,33 @@ var ssgenMsgTxWithConsolidationAtPos2 = &wire.MsgTx{
 	Expiry:   0,
 }
 
+// ssgenMsgTxWithScriptHashConsolidation has a P2SH ("SH") consolidation address.
+var ssgenMsgTxWithScriptHashConsolidation = func() *wire.MsgTx {
+	output, err := CreateSSFeeScriptHashConsolidationOutput(ssgenConsolidationHash160)
+	if err != nil {
+		panic("failed to create test consolidation output: " + err.Error())
+	}
+	tx := ssgenMsgTxWithConsolidation.Copy()
+	tx.TxOut[4] = output
+	return tx
+}()
+
+// ssgenMsgTxWithScriptHashConsolidationAndTreasury has a P2SH consolidation
+// address followed by a treasury vote.
+var ssgenMsgTxWithScriptHashConsolidationAndTreasury = func() *wire.MsgTx {
+	tx := ssgenMsgTxWithConsolidationAndTreasury.Copy()
+	tx.TxOut[4] = ssgenMsgTxWithScriptHashConsolidation.TxOut[4]
+	return tx
+}()
+
+// ssgenMsgTxWithBothConsolidations has a P2SH consolidation address and then
+// a P2PKH one.
+var ssgenMsgTxWithBothConsolidations = func() *wire.MsgTx {
+	tx := ssgenMsgTxWithScriptHashConsolidation.Copy()
+	tx.TxOut = append(tx.TxOut, buildConsolidationOutput())
+	return tx
+}()
+
 // ssgenMsgTxWithConsolidationAndTreasury has both consolidation and treasury vote.
 var ssgenMsgTxWithConsolidationAndTreasury = &wire.MsgTx{
 	SerType: wire.TxSerializeFull,
@@ -195,6 +222,18 @@ func TestCheckSSGenWithConsolidation(t *testing.T) {
 		{
 			name: "valid vote with consolidation and treasury vote",
 			tx:   ssgenMsgTxWithConsolidationAndTreasury,
+		},
+		{
+			name: "valid vote with P2SH consolidation",
+			tx:   ssgenMsgTxWithScriptHashConsolidation,
+		},
+		{
+			name: "valid vote with P2SH consolidation and treasury vote",
+			tx:   ssgenMsgTxWithScriptHashConsolidationAndTreasury,
+		},
+		{
+			name: "valid vote with P2SH and P2PKH consolidation",
+			tx:   ssgenMsgTxWithBothConsolidations,
 		},
 	}
 
