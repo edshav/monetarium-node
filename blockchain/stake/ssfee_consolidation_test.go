@@ -199,6 +199,104 @@ func TestExtractSSFeeConsolidationScript(t *testing.T) {
 			errSubstr: "missing consolidation address",
 		},
 		{
+			name: "SH with wrong push opcode",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)
+				invalidScript[3] = SSConsolidationMarkerH
+				invalidScript[1] = 0x15 // OP_DATA_21 instead of OP_DATA_22
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH without OP_RETURN",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)
+				invalidScript[3] = SSConsolidationMarkerH
+				invalidScript[0] = 0x00 // OP_0 instead of OP_RETURN
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH with invalid length (too short)",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)[:23]
+				invalidScript[3] = SSConsolidationMarkerH
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH with invalid length (too long)",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := append(buildConsolidationScript(testHash160), 0x00)
+				invalidScript[3] = SSConsolidationMarkerH
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "invalid length (too long)",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := append(buildConsolidationScript(testHash160), 0x00)
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
+			name: "SH with wrong first marker byte",
+			buildTx: func() *wire.MsgTx {
+				invalidScript := buildConsolidationScript(testHash160)
+				invalidScript[3] = SSConsolidationMarkerH
+				invalidScript[2] = 0x99
+				return &wire.MsgTx{
+					TxOut: []*wire.TxOut{
+						{PkScript: make([]byte, 38)},
+						{PkScript: make([]byte, 4)},
+						{PkScript: invalidScript},
+					},
+				}
+			},
+			wantErr:   true,
+			errSubstr: "missing consolidation address",
+		},
+		{
 			name: "invalid length (too short)",
 			buildTx: func() *wire.MsgTx {
 				invalidScript := buildConsolidationScript(testHash160)[:23]
