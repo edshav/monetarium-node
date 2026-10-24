@@ -662,6 +662,10 @@ func TestCreateSSFeeTxBatchedScriptHash(t *testing.T) {
 						"%x version 0", test.name, coinType, i, payOut.PkScript,
 						payOut.Version, test.want[i].script)
 				}
+				if payOut.CoinType != coinType {
+					t.Errorf("%s/%v: SSFee %d pays coin type %v", test.name,
+						coinType, i, payOut.CoinType)
+				}
 				amount := big.NewInt(payOut.Value)
 				if coinType.IsSKA() {
 					amount = payOut.SKAValue
