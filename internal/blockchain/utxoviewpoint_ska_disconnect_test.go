@@ -10,6 +10,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/monetarium/monetarium-node/blockchain/chaingen"
 	"github.com/monetarium/monetarium-node/blockchain/stake"
 	"github.com/monetarium/monetarium-node/blockchain/standalone"
 	"github.com/monetarium/monetarium-node/chaincfg"
@@ -28,13 +29,39 @@ type skaDisconnectHarness struct {
 	*chaingenHarness
 	emitAmount *big.Int
 	emitOut    wire.OutPoint // the emitted SKA output
+	emitIn     wire.OutPoint // the null outpoint of the emission's input
 	preEmit    string        // name of the parent of block "bemit"
+
+	// spent is the output spent by the regular transaction block "bemit"
+	// holds besides the emission and spentEntry is its utxo entry before the
+	// block connected.  Both are nil when the emission is the only one.
+	spent      *wire.OutPoint
+	spentEntry *UtxoEntry
 }
+
+// emitPlacement is where block "bemit" holds the SKA emission relative to a
+// regular transaction spending an older coinbase output.
+type emitPlacement int
+
+const (
+	emitAlone       emitPlacement = iota // no spending transaction
+	emitBeforeSpend                      // the emission directly follows the coinbase
+	emitAfterSpend                       // the emission is the last transaction
+)
 
 // newSKADisconnectHarness returns a regnet harness advanced past stake
 // validation height whose tip block "bemit" holds an SKA1 emission paying the
-// generator's p2sh OP_TRUE address.
+// generator's p2sh OP_TRUE address as its last transaction.
 func newSKADisconnectHarness(t *testing.T) *skaDisconnectHarness {
+	t.Helper()
+	return newSKAEmissionHarness(t, emitAlone)
+}
+
+// newSKAEmissionHarness is newSKADisconnectHarness with the emission placed in
+// block "bemit" as requested.  A spending transaction spends an output of a
+// different block than the tickets of "bemit" do, so its spend journal entry
+// differs from theirs.
+func newSKAEmissionHarness(t *testing.T, placement emitPlacement) *skaDisconnectHarness {
 	t.Helper()
 
 	params := cloneParams(chaincfg.RegNetParams())
@@ -75,8 +102,25 @@ func newSKADisconnectHarness(t *testing.T) *skaDisconnectHarness {
 	emitTx.TxIn[0].BlockHeight = wire.NullBlockHeight
 	emitTx.TxIn[0].BlockIndex = wire.NullBlockIndex
 	preEmit := g.TipName()
+	var spend *chaingen.SpendableOut
+	var spent *wire.OutPoint
+	var spentEntry *UtxoEntry
+	if placement != emitAlone {
+		spend = &g.OldestCoinbaseOuts()[0]
+		prevOut := spend.PrevOut()
+		entry, err := g.chain.FetchUtxoEntry(prevOut)
+		if err != nil || entry == nil {
+			t.Fatalf("FetchUtxoEntry(%v): entry %v, err %v", prevOut, entry, err)
+		}
+		spent, spentEntry = &prevOut, entry.Clone()
+	}
 	outs := g.OldestCoinbaseOuts()
-	g.NextBlock("bemit", nil, outs[1:], func(b *wire.MsgBlock) {
+	g.NextBlock("bemit", spend, outs[1:], func(b *wire.MsgBlock) {
+		if placement == emitBeforeSpend {
+			b.Transactions = append(b.Transactions[:1],
+				append([]*wire.MsgTx{emitTx}, b.Transactions[1:]...)...)
+			return
+		}
 		b.AddTransaction(emitTx)
 	})
 	g.SaveTipCoinbaseOuts()
@@ -91,6 +135,9 @@ func newSKADisconnectHarness(t *testing.T) *skaDisconnectHarness {
 			Index: 0,
 			Tree:  wire.TxTreeRegular,
 		},
+		emitIn:     emitTx.TxIn[0].PreviousOutPoint,
+		spent:      spent,
+		spentEntry: spentEntry,
 	}
 }
 
@@ -443,42 +490,104 @@ func TestDisconnectUnspendableOutputs(t *testing.T) {
 	}
 }
 
+// utxoMeta describes the fields of a utxo entry that undoing its spend
+// restores from the spend journal.
+func utxoMeta(entry *UtxoEntry) string {
+	return fmt.Sprintf("coin type %d, amount %d, script %x (version %d), "+
+		"height %d, index %d, coinbase %v, expiry %v, tx type %v",
+		entry.CoinType(), entry.Amount(), entry.PkScript(),
+		entry.ScriptVersion(), entry.BlockHeight(), entry.BlockIndex(),
+		entry.IsCoinBase(), entry.HasExpiry(), entry.TransactionType())
+}
+
+// assertSKAEmissionUndone ensures the utxo set at the current tip holds neither
+// the output of the undone SKA emission nor an entry for its null input, and
+// holds the output spent by the other transaction of block "bemit", if any,
+// unspent with the metadata it had before the block connected.
+func (h *skaDisconnectHarness) assertSKAEmissionUndone() {
+	t := h.t
+	t.Helper()
+
+	h.assertUtxoGone(h.emitOut)
+
+	entry, err := h.chain.FetchUtxoEntry(h.emitIn)
+	if err != nil {
+		t.Fatalf("FetchUtxoEntry(%v): %v", h.emitIn, err)
+	}
+	if entry != nil && !entry.IsSpent() {
+		t.Errorf("undoing the SKA emission added its null input %v to the "+
+			"utxo set (%s)", h.emitIn, utxoMeta(entry))
+	}
+
+	if h.spent == nil {
+		return
+	}
+	entry, err = h.chain.FetchUtxoEntry(*h.spent)
+	if err != nil {
+		t.Fatalf("FetchUtxoEntry(%v): %v", *h.spent, err)
+	}
+	if entry == nil || entry.IsSpent() {
+		t.Errorf("output %v spent by the undone block was not restored to "+
+			"the utxo set", *h.spent)
+		return
+	}
+	if got, want := utxoMeta(entry), utxoMeta(h.spentEntry); got != want {
+		t.Errorf("restored output %v metadata:\ngot  %s\nwant %s", *h.spent,
+			got, want)
+	}
+}
+
 // TestDisconnectSKAEmissionBlock ensures a block holding an SKA emission can be
 // undone, both when the next block disapproves its regular tree and when it is
-// disconnected by a reorganization, and that the emitted output is removed.
+// disconnected by a reorganization, wherever the emission sits relative to a
+// transaction spending an output.  The emitted output must be removed, the
+// emission's null input must not enter the utxo set, and the spent output must
+// be restored with its own metadata.
 func TestDisconnectSKAEmissionBlock(t *testing.T) {
-	t.Run("Disapproval", func(t *testing.T) {
-		h := newSKADisconnectHarness(t)
+	placements := []struct {
+		name      string
+		placement emitPlacement
+	}{
+		{"EmissionAlone", emitAlone},
+		{"EmissionBeforeSpend", emitBeforeSpend},
+		{"EmissionAfterSpend", emitAfterSpend},
+	}
+	for _, p := range placements {
+		t.Run(p.name, func(t *testing.T) {
+			t.Run("Disapproval", func(t *testing.T) {
+				h := newSKAEmissionHarness(t, p.placement)
 
-		//   ... -> bemit -> bdis (disapproves bemit)
-		outs := h.OldestCoinbaseOuts()
-		h.NextBlock("bdis", nil, outs[1:], func(b *wire.MsgBlock) {
-			b.Header.VoteBits &^= 0x0001
-			h.ReplaceVoteBits(0x0000)(b)
+				//   ... -> bemit -> bdis (disapproves bemit)
+				outs := h.OldestCoinbaseOuts()
+				h.NextBlock("bdis", nil, outs[1:], func(b *wire.MsgBlock) {
+					b.Header.VoteBits &^= 0x0001
+					h.ReplaceVoteBits(0x0000)(b)
+				})
+				h.AssertTipDisapprovesPrevious()
+				h.AcceptTipBlock()
+
+				h.assertSKAEmissionUndone()
+				h.flushUtxoCache()
+				h.assertSKAEmissionUndone()
+			})
+
+			t.Run("Reorg", func(t *testing.T) {
+				h := newSKAEmissionHarness(t, p.placement)
+
+				//   ... -> bemit
+				//      \-> bx2 -> by2
+				h.SetTip(h.preEmit)
+				h.NextBlock("bx2", nil, nil)
+				h.AcceptedToSideChainWithExpectedTip("bemit")
+				h.NextBlock("by2", nil, nil)
+				h.AcceptTipBlock()
+
+				h.assertSKAEmissionUndone()
+				h.flushUtxoCache()
+				h.assertSKAEmissionUndone()
+			})
 		})
-		h.AssertTipDisapprovesPrevious()
-		h.AcceptTipBlock()
-
-		h.assertUtxoGone(h.emitOut)
-		h.flushUtxoCache()
-		h.assertUtxoGone(h.emitOut)
-	})
-
-	t.Run("Reorg", func(t *testing.T) {
-		h := newSKADisconnectHarness(t)
-
-		//   ... -> bemit
-		//      \-> bx2 -> by2
-		h.SetTip(h.preEmit)
-		h.NextBlock("bx2", nil, nil)
-		h.AcceptedToSideChainWithExpectedTip("bemit")
-		h.NextBlock("by2", nil, nil)
-		h.AcceptTipBlock()
-
-		h.assertUtxoGone(h.emitOut)
-		h.flushUtxoCache()
-		h.assertUtxoGone(h.emitOut)
-	})
+	}
 }
 
 // TestDisconnectSKAEmissionInputs ensures disconnecting the regular tree of a
