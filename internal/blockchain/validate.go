@@ -2628,6 +2628,7 @@ func (b *BlockChain) spentSSFeeType(node *blockNode, txIn *wire.TxIn,
 // - Staker SSFee (SF) can distribute any coin type including VAR
 // - Staker SSFee (SF) pays the consolidation script of a voter
 // - Miner SSFee (MF) distributes non-VAR only (VAR miner fees go to coinbase)
+// - Miner SSFee (MF) distributes a positive miner fee for its coin type
 // - All coin types with staker fees have corresponding SSFee transactions
 // - All non-VAR coin types with miner fees have corresponding SSFee transactions
 //
@@ -2847,8 +2848,14 @@ func (b *BlockChain) validateSSFeeTxns(block *dcrutil.Block, node *blockNode,
 			if coinType.IsSKA() {
 				// SKA: use bigint comparison throughout
 				expectedFeeSKA := minerFeesByType.GetBig(coinType)
-				if expectedFeeSKA == nil {
-					expectedFeeSKA = new(big.Int)
+				// A miner SSFee must distribute a miner fee.  Otherwise it
+				// could augment the payout of another miner for free, and
+				// wallets that apply coinbase maturity to it would have to
+				// wait for that maturity again.
+				if expectedFeeSKA == nil || expectedFeeSKA.Sign() <= 0 {
+					return ruleError(ErrStakeFees,
+						fmt.Sprintf("miner SSFee for coin type %d in a block "+
+							"without miner fees in it", coinType))
 				}
 				expectedTotalSKA := new(big.Int).Set(expectedFeeSKA)
 				if !isNullInput && inputValueSKA != nil {

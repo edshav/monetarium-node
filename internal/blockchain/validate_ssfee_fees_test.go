@@ -108,7 +108,8 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 		addSSFees(b, excess)
 	})
 	_, err = g.chain.ProcessBlock(dcrutil.NewBlock(g.Tip()))
-	const wantMsg = "miner SSFee (null input) for coin type 1 distributes"
+	// The excess is not a fee, so the block has no SKA1 miner fee at all.
+	const wantMsg = "miner SSFee for coin type 1 in a block without miner fees in it"
 	if !errors.Is(err, ErrStakeFees) ||
 		!strings.Contains(err.Error(), wantMsg) {
 
@@ -278,6 +279,40 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 	g.NextBlock("baugment", nil, nil, spendChange(fee),
 		augment(staker, staker), augment(miner, miner))
 	g.AcceptTipBlock()
+
+	// Reorganize to a sibling of baugment with fewer votes that augments the
+	// same payouts.  Disconnecting baugment restores the payouts of bska4 from
+	// its spend journal, and the sibling, which was never validated, connects
+	// only if they still read as SSFee outputs.  Then reorganize back.
+	//
+	//   ... -> bska4 -> baugment
+	//              \-> baugment2
+	g.SetTip("bska4")
+	g.NextBlock("baugment2", nil, nil, g.ReplaceWithNVotes(votes),
+		spendChange(fee), augment(staker, staker), augment(miner, miner))
+	g.AcceptedToSideChainWithExpectedTip("baugment")
+	g.ForceTipReorg("baugment", "baugment2")
+	g.ExpectTip("baugment2")
+	g.ForceTipReorg("baugment2", "baugment")
+	g.ExpectTip("baugment")
+
+	// Create a block without SKA1 fees whose miner SSFee adds nothing to the
+	// miner payout of baugment.
+	//
+	//   ... -> baugment -> bfreeminer
+	g.SetTip("baugment")
+	tip = g.Tip()
+	g.NextBlock("bfreeminer", nil, nil, func(b *wire.MsgBlock) {
+		b.AddSTransaction(skaSSFeeTx(stake.CreateMinerSSFeeMarker(
+			int64(b.Header.Height)), minerScript, new(big.Int)))
+	}, augment(miner, miner))
+	_, err = g.chain.ProcessBlock(dcrutil.NewBlock(g.Tip()))
+	if !errors.Is(err, ErrStakeFees) ||
+		!strings.Contains(err.Error(), wantMsg) {
+
+		t.Fatalf("block bfreeminer: got error %v, want %v containing %q",
+			err, ErrStakeFees, wantMsg)
+	}
 }
 
 // skaSSFeeTx returns a null-input SKA1 SSFee transaction with the given marker
