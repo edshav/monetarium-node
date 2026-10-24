@@ -5480,8 +5480,10 @@ func (b *BlockChain) checkConnectBlock(node *blockNode, block, parent *dcrutil.B
 
 		// Validate the SSFee transactions, which a block with fees to
 		// distribute must have.
-		log.Infof("Validating %d SSFee transaction(s) for block height %d with total fees %v (voters=%d)",
-			len(ssFeeTxns), node.height, distributedFees, node.voters)
+		if len(ssFeeTxns) > 0 {
+			log.Infof("Validating %d SSFee transaction(s) for block height %d with total fees %v (voters=%d)",
+				len(ssFeeTxns), node.height, distributedFees, node.voters)
+		}
 		err = b.validateSSFeeTxns(block, node, votes, ssFeeTxns, distributedFees, subsidySplitVariant)
 		if err != nil {
 			return err
