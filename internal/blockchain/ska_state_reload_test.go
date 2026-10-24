@@ -6,10 +6,12 @@ package blockchain
 
 import (
 	"errors"
+	"math/big"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/database"
 	"github.com/monetarium/monetarium-node/dcrutil"
+	"github.com/monetarium/monetarium-node/txscript/stdscript"
 	"github.com/monetarium/monetarium-node/wire"
 )
 
@@ -140,7 +142,7 @@ func (db *failUpdateDB) Update(fn func(database.Tx) error) error {
 
 // TestSKAStateReloadAfterFailedBlockUpdate ensures a failed database update
 // while connecting or disconnecting a block leaves the in-memory SKA emission
-// state matching the database.
+// and burn state matching the database.
 func TestSKAStateReloadAfterFailedBlockUpdate(t *testing.T) {
 	// newEmitBlock returns a harness whose tip block "bemit" holds an SKA1
 	// emission and has not been processed yet.
@@ -209,5 +211,82 @@ func TestSKAStateReloadAfterFailedBlockUpdate(t *testing.T) {
 			t.Fatalf("burned amount after failed disconnect: got %v, want "+
 				"none", got)
 		}
+	})
+	// newBurnBlock returns a harness whose tip block "bburn" burns
+	// burnAmount of SKA1 and has not been processed yet.
+	const burnAmount = 100
+	newBurnBlock := func(t *testing.T) *skaDisconnectHarness {
+		h := newSKADisconnectHarness(t)
+		burnTx := h.createSKASpendTx()
+		burnTx.TxOut[0].SKAValue.Sub(burnTx.TxOut[0].SKAValue,
+			bigInt(burnAmount))
+		burnTx.AddTxOut(&wire.TxOut{
+			SKAValue: bigInt(burnAmount),
+			CoinType: 1,
+			PkScript: stdscript.NewSKABurnScriptV0(1),
+		})
+		outs := h.OldestCoinbaseOuts()
+		h.NextBlock("bburn", nil, outs[1:], func(b *wire.MsgBlock) {
+			addSKASpendTx(b, burnTx)
+		})
+		return h
+	}
+
+	// checkBurned ensures the in-memory and the stored SKA1 burned amount
+	// are both want, or both none when want is nil.
+	checkBurned := func(t *testing.T, h *skaDisconnectHarness, db database.DB,
+		when string, want *big.Int) {
+
+		t.Helper()
+		stored, err := NewSKABurnState(db)
+		if err != nil {
+			t.Fatalf("NewSKABurnState: %v", err)
+		}
+		for _, got := range []struct {
+			what   string
+			amount *big.Int
+		}{
+			{"in memory", h.chain.skaBurnState.GetBurnedAmount(1)},
+			{"stored", stored.GetBurnedAmount(1)},
+		} {
+			if (got.amount == nil) != (want == nil) ||
+				(want != nil && got.amount.Cmp(want) != 0) {
+				t.Fatalf("%s: burned %s %v, want %v", when, got.what,
+					got.amount, want)
+			}
+		}
+	}
+
+	t.Run("ConnectBurn", func(t *testing.T) {
+		h := newBurnBlock(t)
+		db, burnState := h.chain.db, h.chain.skaBurnState
+
+		// Fail the update that records the burn.
+		h.chain.db = &failUpdateDB{DB: db, fail: func() bool {
+			return burnState.GetBurnedAmount(1) != nil
+		}}
+		_, err := h.chain.ProcessBlock(dcrutil.NewBlock(h.Tip()))
+		if !errors.Is(err, errForcedUpdate) {
+			t.Fatalf("connect: got %v, want %v", err, errForcedUpdate)
+		}
+		checkBurned(t, h, db, "after failed connect", nil)
+	})
+
+	t.Run("DisconnectBurn", func(t *testing.T) {
+		h := newBurnBlock(t)
+		h.AcceptTipBlock()
+		db, burnState := h.chain.db, h.chain.skaBurnState
+		checkBurned(t, h, db, "after connect", bigInt(burnAmount))
+
+		// Fail the update that removes the burn.
+		h.chain.db = &failUpdateDB{DB: db, fail: func() bool {
+			return burnState.GetBurnedAmount(1) == nil
+		}}
+		hash := h.Tip().BlockHash()
+		err := h.chain.InvalidateBlock(&hash)
+		if !errors.Is(err, errForcedUpdate) {
+			t.Fatalf("disconnect: got %v, want %v", err, errForcedUpdate)
+		}
+		checkBurned(t, h, db, "after failed disconnect", bigInt(burnAmount))
 	})
 }
