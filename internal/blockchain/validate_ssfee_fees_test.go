@@ -280,10 +280,27 @@ func TestSSFeeDistributesSKAFees(t *testing.T) {
 		augment(staker, staker), augment(miner, miner))
 	g.AcceptTipBlock()
 
+	// Reorganize to a sibling of baugment with fewer votes that augments the
+	// same payouts.  Disconnecting baugment restores the payouts of bska4 from
+	// its spend journal, and the sibling, which was never validated, connects
+	// only if they still read as SSFee outputs.  Then reorganize back.
+	//
+	//   ... -> bska4 -> baugment
+	//              \-> baugment2
+	g.SetTip("bska4")
+	g.NextBlock("baugment2", nil, nil, g.ReplaceWithNVotes(votes),
+		spendChange(fee), augment(staker, staker), augment(miner, miner))
+	g.AcceptedToSideChainWithExpectedTip("baugment")
+	g.ForceTipReorg("baugment", "baugment2")
+	g.ExpectTip("baugment2")
+	g.ForceTipReorg("baugment2", "baugment")
+	g.ExpectTip("baugment")
+
 	// Create a block without SKA1 fees whose miner SSFee adds nothing to the
 	// miner payout of baugment.
 	//
 	//   ... -> baugment -> bfreeminer
+	g.SetTip("baugment")
 	tip = g.Tip()
 	g.NextBlock("bfreeminer", nil, nil, func(b *wire.MsgBlock) {
 		b.AddSTransaction(skaSSFeeTx(stake.CreateMinerSSFeeMarker(
