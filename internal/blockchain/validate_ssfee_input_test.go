@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/blockchain/stake"
@@ -571,6 +572,75 @@ func TestValidateSSFeeTxnsRejectsMismatchedType(t *testing.T) {
 				totalFees, standalone.SSVMonetarium)
 			if !errors.Is(err, ErrBadSSFeeInput) {
 				t.Fatalf("got error %v, want ErrBadSSFeeInput", err)
+			}
+		})
+	}
+}
+
+// TestValidateSSFeeTxnsRejectsMinerSSFeeWithoutFee ensures validateSSFeeTxns
+// rejects a miner SSFee in a block without miner fees for its coin type, with a
+// null input and paying nothing, or augmenting a miner SSFee output and paying
+// it back unchanged.
+func TestValidateSSFeeTxnsRejectsMinerSSFeeWithoutFee(t *testing.T) {
+	params := chaincfg.SimNetParams()
+	b := newFakeChain(params)
+	const ska1 = cointype.CoinType(1)
+
+	hash160 := bytes.Repeat([]byte{0x11}, 20)
+	payScript, err := stake.ConsolidationAddrToPkScript(hash160)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent block holds a miner SSFee.
+	srcMF := newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(1),
+		3000, payScript)
+	srcBlock := &wire.MsgBlock{
+		Header:        wire.BlockHeader{PrevBlock: b.bestChain.Tip().hash, Height: 1},
+		STransactions: []*wire.MsgTx{srcMF},
+	}
+	srcNode := newBlockNode(&srcBlock.Header, b.bestChain.Tip())
+	b.recentBlocks.Put(srcNode.hash, dcrutil.NewBlock(srcBlock))
+
+	vote := wire.NewMsgTx()
+	vote.AddTxOut(&wire.TxOut{PkScript: []byte{txscript.OP_RETURN}})
+	vote.AddTxOut(&wire.TxOut{PkScript: []byte{txscript.OP_RETURN}})
+	vote.AddTxOut(&wire.TxOut{Value: 100, PkScript: payScript[1:]})
+	consolidation, err := stake.CreateSSFeeConsolidationOutput(hash160)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vote.AddTxOut(consolidation)
+
+	tests := []struct {
+		name  string
+		ssFee *wire.MsgTx
+	}{{
+		name: "null input paying nothing",
+		ssFee: newNullInputSSFeeTestTx(ska1, stake.CreateMinerSSFeeMarker(2),
+			0, payScript),
+	}, {
+		name: "augmented input paid back unchanged",
+		ssFee: newSSFeeTestTx(augmentingSSFeeTxIn(srcMF, 1, 0), ska1,
+			stake.CreateMinerSSFeeMarker(2), 3000, payScript),
+	}}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			msgBlock := &wire.MsgBlock{
+				Header:        wire.BlockHeader{PrevBlock: srcNode.hash, Height: 2},
+				STransactions: []*wire.MsgTx{vote, test.ssFee},
+			}
+			node := newBlockNode(&msgBlock.Header, srcNode)
+
+			err := b.validateSSFeeTxns(dcrutil.NewBlock(msgBlock), node,
+				[]*dcrutil.Tx{dcrutil.NewTx(vote)}, []*wire.MsgTx{test.ssFee},
+				wire.NewFeesByType(), standalone.SSVMonetarium)
+			const wantMsg = "without miner fees in it"
+			if !errors.Is(err, ErrStakeFees) ||
+				!strings.Contains(err.Error(), wantMsg) {
+
+				t.Fatalf("got error %v, want %v containing %q", err,
+					ErrStakeFees, wantMsg)
 			}
 		})
 	}
