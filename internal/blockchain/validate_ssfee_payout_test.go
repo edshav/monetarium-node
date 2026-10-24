@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math/big"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/monetarium/monetarium-node/blockchain/stake"
@@ -409,10 +410,13 @@ func TestSSFeeRejectsPayoutLayouts(t *testing.T) {
 // TestSSFeeScriptHashConsolidation ensures a staker SSFee to a voter with a
 // P2SH ("SH") consolidation address pays the OP_SSGEN-tagged P2SH script of
 // that address: a P2PKH and a P2SH voter of the same hash160 are paid
-// separately, and a payout of the right hash160 under the other script type
-// is rejected.
+// separately, a unit moved between their payouts is rejected, groups are
+// ordered by script for the remainder, and a payout of the right hash160
+// under the other script type is rejected by the check that the recipient is
+// the consolidation script of a voter.
 func TestSSFeeScriptHashConsolidation(t *testing.T) {
 	addr := []byte{1: 0xaa, 19: 0x01}
+	lowAddr := []byte{1: 0x11, 19: 0x02}
 	minerAddr := []byte{1: 0xcc, 19: 0x03}
 	minerScript, err := stake.ConsolidationAddrToPkScript(minerAddr)
 	if err != nil {
@@ -429,11 +433,13 @@ func TestSSFeeScriptHashConsolidation(t *testing.T) {
 	p2pkhVote := ssFeeTestVote(t, addr)
 	p2shVote := ssFeeTestScriptHashVote(t, addr)
 
+	const notVoterScript = "does not match any voter consolidation script"
 	tests := []struct {
 		name      string
 		votes     []*dcrutil.Tx
 		payScript []byte // replaces the payout script of ssFeeTxns[0]
-		wantErr   bool
+		munge     func([]*wire.MsgTx)
+		wantErr   string // part of the ErrStakeFees message, "" to accept
 	}{{
 		name:  "P2SH voter",
 		votes: []*dcrutil.Tx{p2shVote},
@@ -441,15 +447,43 @@ func TestSSFeeScriptHashConsolidation(t *testing.T) {
 		name:  "P2PKH and P2SH voters of the same hash160",
 		votes: []*dcrutil.Tx{p2shVote, p2pkhVote, p2shVote},
 	}, {
+		// The P2PKH group sorts first and is paid in ssFeeTxns[0], the P2SH
+		// group in ssFeeTxns[1].  The staker total is unchanged.
+		name:  "unit moved from the P2PKH to the P2SH group of a hash160",
+		votes: []*dcrutil.Tx{p2shVote, p2pkhVote, p2shVote},
+		munge: func(txns []*wire.MsgTx) {
+			from, to := txns[0].TxOut[1], txns[1].TxOut[1]
+			if from.CoinType.IsSKA() {
+				from.SKAValue = new(big.Int).Sub(from.SKAValue, big.NewInt(1))
+				to.SKAValue = new(big.Int).Add(to.SKAValue, big.NewInt(1))
+				return
+			}
+			from.Value--
+			to.Value++
+		},
+		wantErr: "SSFee amount mismatch",
+	}, {
+		// Two votes leave a remainder of 1 for VAR and SKA1.  The P2SH voter
+		// has the smaller hash160, but every P2PKH script sorts before every
+		// P2SH script, so the P2PKH group takes the remainder.
+		name: "P2SH voter with a smaller hash160 than a P2PKH voter",
+		votes: []*dcrutil.Tx{ssFeeTestScriptHashVote(t, lowAddr),
+			p2pkhVote},
+	}, {
+		name:    "P2SH payout with script version 1",
+		votes:   []*dcrutil.Tx{p2shVote},
+		munge:   func(txns []*wire.MsgTx) { txns[0].TxOut[1].Version = 1 },
+		wantErr: "script version 1 is not 0",
+	}, {
 		name:      "P2SH voter paid the P2PKH script",
 		votes:     []*dcrutil.Tx{p2shVote},
 		payScript: p2pkhScript,
-		wantErr:   true,
+		wantErr:   notVoterScript,
 	}, {
 		name:      "P2PKH voter paid the P2SH script",
 		votes:     []*dcrutil.Tx{p2pkhVote},
 		payScript: p2shScript,
-		wantErr:   true,
+		wantErr:   notVoterScript,
 	}}
 
 	for _, coinType := range []cointype.CoinType{cointype.CoinTypeVAR, 1} {
@@ -464,12 +498,17 @@ func TestSSFeeScriptHashConsolidation(t *testing.T) {
 				if test.payScript != nil {
 					ssFeeTxns[0].TxOut[1].PkScript = test.payScript
 				}
+				if test.munge != nil {
+					test.munge(ssFeeTxns)
+				}
 
 				err := (&BlockChain{}).validateSSFeeTxns(nil, nil,
 					test.votes, ssFeeTxns, fees, standalone.SSVMonetarium)
-				if test.wantErr {
-					if !errors.Is(err, ErrStakeFees) {
-						t.Fatalf("got error %v, want %v", err, ErrStakeFees)
+				if test.wantErr != "" {
+					if !errors.Is(err, ErrStakeFees) ||
+						!strings.Contains(err.Error(), test.wantErr) {
+						t.Fatalf("got error %v, want %v containing %q", err,
+							ErrStakeFees, test.wantErr)
 					}
 					return
 				}
