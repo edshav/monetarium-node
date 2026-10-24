@@ -538,6 +538,9 @@ func TestAddRegularInputUtxosOnlyReferenced(t *testing.T) {
 //     transaction
 //   - Rejection of a disapproving block that reincludes a transaction after
 //     the transaction that spends its output
+//   - Reorganization away from and back to an already validated block that
+//     disapproves its parent, reincludes a transaction from it and spends its
+//     output as a zero conf spend
 func testDisapprovalScenarios(t *testing.T, flushUtxoCache bool) {
 	// Create a test harness initialized with the genesis block as the tip and
 	// advance it to stake validation height.
@@ -1109,6 +1112,63 @@ func testDisapprovalScenarios(t *testing.T, flushUtxoCache bool) {
 		g.AcceptTipBlock()
 		g.ExpectTip("s10b1")
 		txB := b1.Transactions[2]
+		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
+		g.ExpectUtxoUnspendable(outpoint(txA, 0))
+		g.ExpectUtxoSpendable(outpoint(txB, 0))
+	}
+
+	// -------------------------------------------------------------------------
+	// Create a block with a regular transaction that spends a coinbase output,
+	// followed by a block that disapproves the regular tx tree of the previous
+	// block, reincludes that transaction, and spends its output with a new zero
+	// conf transaction.
+	//
+	// Then reorganize to a competing branch that approves the original parent
+	// and finally back to the branch that disapproves it.
+	//
+	// This exercises reattaching an already validated disapproving block.  The
+	// output of the reincluded transaction is unspent in the utxo set when the
+	// block is reattached, so its new zero conf spend must still be recorded in
+	// the utxo set.
+	//
+	//   ... -> s11b0 -> s11b1 (disapproves s11b0) -> s11b2 -> s11b3
+	//               \-> s11b1a (approves s11b0)   -> s11b2a
+	//
+	// s11b0: txA (spends a coinbase output)
+	// s11b1: txA (reincluded from s11b0) -> txB (zero conf spend of txA)
+	// -------------------------------------------------------------------------
+	{
+		outs := g.OldestCoinbaseOuts()
+		b0 := g.NextBlock("s11b0", &outs[0], outs[1:])
+		g.AcceptTipBlock()
+		txA := b0.Transactions[1]
+
+		outs = g.OldestCoinbaseOuts()
+		b1 := g.NextBlock("s11b1", nil, outs[1:], disapproveParent, addTx(txA),
+			addZeroConfSpend(1, 0))
+		g.AssertTipDisapprovesPrevious()
+		g.AcceptTipBlock()
+		g.ExpectTip("s11b1")
+		txB := b1.Transactions[2]
+		g.ExpectUtxoUnspendable(outpoint(txA, 0))
+		g.ExpectUtxoSpendable(outpoint(txB, 0))
+
+		g.SetTip("s11b0")
+		g.NextBlock("s11b1a", nil, outs[1:])
+		g.AcceptedToSideChainWithExpectedTip("s11b1")
+		g.NextBlock("s11b2a", nil, nil)
+		g.AcceptTipBlock()
+		g.ExpectTip("s11b2a")
+		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
+		g.ExpectUtxoSpendable(outpoint(txA, 0))
+		g.ExpectUtxoUnspendable(outpoint(txB, 0))
+
+		g.SetTip("s11b1")
+		g.NextBlock("s11b2", nil, nil)
+		g.AcceptedToSideChainWithExpectedTip("s11b2a")
+		g.NextBlock("s11b3", nil, nil)
+		g.AcceptTipBlock()
+		g.ExpectTip("s11b3")
 		g.ExpectUtxoUnspendable(txA.TxIn[0].PreviousOutPoint)
 		g.ExpectUtxoUnspendable(outpoint(txA, 0))
 		g.ExpectUtxoSpendable(outpoint(txB, 0))

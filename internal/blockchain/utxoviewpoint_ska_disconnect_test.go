@@ -705,9 +705,11 @@ func (h *skaDisconnectHarness) createSKAChildTx(parent *wire.MsgTx,
 // TestDisapprovalSKAZeroConf ensures the utxo set stays correct when a block
 // disapproves the regular tree of its parent, reincludes the SKA transaction
 // from it and spends the SKA output of that transaction as a zero conf spend,
-// and when a reorganization later approves the parent instead.  It also ensures
+// and when a reorganization later approves the parent instead, including a
+// parent whose regular tree holds its own zero conf SKA spend.  It also ensures
 // a disapproving block that spends that output without reincluding its
 // creating transaction is rejected without changing the utxo set.
+// Finally, it reorganizes away from such a block and back, reattaching it.
 //
 // It runs with the utxo cache flushed after every block and with flushes
 // disabled.
@@ -801,6 +803,102 @@ func TestDisapprovalSKAZeroConf(t *testing.T) {
 				"type 1, SKA amount %v", outpoint(txA), entry.CoinType(),
 				entry.SKAAmount(), want)
 		}
+
+		//   ... -> bz2a -> bz3 -> bz4 (disapproves bz3)
+		//                     \-> bz4a (approves bz3) -> bz5a
+		//
+		// bz3: txC (spends the output of txA) -> txD (zero conf spend of txC)
+		// bz4: txC (reincluded from bz3)
+		//
+		// The reorganization reconnects the regular tree of bz3 while the
+		// output of txC, restored by undoing bz4, is in the utxo set, so its
+		// zero conf spend by txD must still be recorded in the utxo set.
+		var txC, txD *wire.MsgTx
+		outs = h.OldestCoinbaseOuts()
+		b3 := h.NextBlock("bz3", nil, outs[1:], func(b *wire.MsgBlock) {
+			txIdx := uint32(len(b.Transactions))
+			txC = h.createSKAChildTx(txA, b0.Header.Height,
+				uint32(len(b0.Transactions)-1))
+			txD = h.createSKAChildTx(txC, b.Header.Height, txIdx)
+			addSKASpendTx(b, txC, txD)
+		})
+		h.AcceptTipBlock()
+		h.ExpectUtxoUnspendable(outpoint(txA))
+		h.ExpectUtxoUnspendable(outpoint(txC))
+		h.ExpectUtxoSpendable(outpoint(txD))
+
+		outs = h.OldestCoinbaseOuts()
+		h.NextBlock("bz4", nil, outs[1:], disapproveParent,
+			func(b *wire.MsgBlock) { addSKASpendTx(b, txC) })
+		h.AssertTipDisapprovesPrevious()
+		h.AcceptTipBlock()
+		h.ExpectTip("bz4")
+		h.ExpectUtxoUnspendable(outpoint(txA))
+		h.ExpectUtxoSpendable(outpoint(txC))
+		h.ExpectUtxoUnspendable(outpoint(txD))
+
+		h.SetTip("bz3")
+		h.NextBlock("bz4a", nil, outs[1:])
+		h.AcceptedToSideChainWithExpectedTip("bz4")
+		h.NextBlock("bz5a", nil, nil)
+		h.AcceptTipBlock()
+		h.ExpectTip("bz5a")
+		h.ExpectUtxoUnspendable(outpoint(txA))
+		h.ExpectUtxoUnspendable(outpoint(txC))
+		h.ExpectUtxoSpendable(outpoint(txD))
+
+		//   ... -> bz5a -> bz6 -> bz7 (disapproves bz6) -> bz8 -> bz9
+		//                     \-> bz7a (approves bz6)  -> bz8a
+		//
+		// bz6: txE (spends the output of txD)
+		// bz7: txE (reincluded from bz6) -> txF (zero conf spend of txE)
+		//
+		// The reorganization back to bz9 reattaches bz7 as already validated
+		// while the output of txE is in the utxo set, so its zero conf spend by
+		// txF must still be recorded in the utxo set.
+		txE := h.createSKAChildTx(txD, b3.Header.Height,
+			uint32(len(b3.Transactions)-1))
+		outs = h.OldestCoinbaseOuts()
+		h.NextBlock("bz6", nil, outs[1:], func(b *wire.MsgBlock) {
+			addSKASpendTx(b, txE)
+		})
+		h.AcceptTipBlock()
+		h.ExpectUtxoUnspendable(outpoint(txD))
+		h.ExpectUtxoSpendable(outpoint(txE))
+
+		var txF *wire.MsgTx
+		outs = h.OldestCoinbaseOuts()
+		h.NextBlock("bz7", nil, outs[1:], disapproveParent,
+			func(b *wire.MsgBlock) {
+				txF = h.createSKAChildTx(txE, b.Header.Height,
+					uint32(len(b.Transactions)))
+				addSKASpendTx(b, txE, txF)
+			})
+		h.AssertTipDisapprovesPrevious()
+		h.AcceptTipBlock()
+		h.ExpectTip("bz7")
+		h.ExpectUtxoUnspendable(outpoint(txE))
+		h.ExpectUtxoSpendable(outpoint(txF))
+
+		h.SetTip("bz6")
+		h.NextBlock("bz7a", nil, outs[1:])
+		h.AcceptedToSideChainWithExpectedTip("bz7")
+		h.NextBlock("bz8a", nil, nil)
+		h.AcceptTipBlock()
+		h.ExpectTip("bz8a")
+		h.ExpectUtxoUnspendable(outpoint(txD))
+		h.ExpectUtxoSpendable(outpoint(txE))
+		h.ExpectUtxoUnspendable(outpoint(txF))
+
+		h.SetTip("bz7")
+		h.NextBlock("bz8", nil, nil)
+		h.AcceptedToSideChainWithExpectedTip("bz8a")
+		h.NextBlock("bz9", nil, nil)
+		h.AcceptTipBlock()
+		h.ExpectTip("bz9")
+		h.ExpectUtxoUnspendable(outpoint(txD))
+		h.ExpectUtxoUnspendable(outpoint(txE))
+		h.ExpectUtxoSpendable(outpoint(txF))
 	}
 
 	t.Run("utxo cache flush enabled", func(t *testing.T) { run(t, true) })
