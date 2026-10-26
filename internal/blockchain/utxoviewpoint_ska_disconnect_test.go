@@ -50,17 +50,21 @@ const (
 )
 
 // newSKADisconnectHarness returns a regnet harness advanced past stake
-// validation height whose tip block "bemit" holds an SKA1 emission paying the
-// generator's p2sh OP_TRUE address as its last transaction.
+// validation height whose block "bemit" holds an SKA1 emission paying the
+// generator's p2sh OP_TRUE address, with the tip at the height where that
+// output is mature.
 func newSKADisconnectHarness(t *testing.T) *skaDisconnectHarness {
 	t.Helper()
-	return newSKAEmissionHarness(t, emitAlone)
+	h := newSKAEmissionHarness(t, emitAlone)
+	h.advanceToEmissionMaturity()
+	return h
 }
 
-// newSKAEmissionHarness is newSKADisconnectHarness with the emission placed in
-// block "bemit" as requested.  A spending transaction spends an output of a
-// different block than the tickets of "bemit" do, so its spend journal entry
-// differs from theirs.
+// newSKAEmissionHarness returns a regnet harness advanced past stake
+// validation height whose tip block "bemit" holds an SKA1 emission paying the
+// generator's p2sh OP_TRUE address, placed as requested.  A spending
+// transaction spends an output of a different block than the tickets of
+// "bemit" do, so its spend journal entry differs from theirs.
 func newSKAEmissionHarness(t *testing.T, placement emitPlacement) *skaDisconnectHarness {
 	t.Helper()
 
@@ -344,7 +348,6 @@ func TestDisconnectSKAOutputs(t *testing.T) {
 
 	t.Run("Disapproval", func(t *testing.T) {
 		h := newSKADisconnectHarness(t)
-		h.advanceToEmissionMaturity()
 
 		//   ... -> bskamat# -> bx (spends the SKA emission)
 		spendTx := h.createSKASpendTx()
@@ -375,7 +378,6 @@ func TestDisconnectSKAOutputs(t *testing.T) {
 
 	t.Run("Reorg", func(t *testing.T) {
 		h := newSKADisconnectHarness(t)
-		h.advanceToEmissionMaturity()
 		forkName := h.TipName()
 
 		//   ... -> bskamat# -> bx (spends the SKA emission) -> by
@@ -442,7 +444,6 @@ func TestDisconnectUnspendableOutputs(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			h := newSKADisconnectHarness(t)
-			h.advanceToEmissionMaturity()
 
 			// The output takes its amount from the first output of its
 			// transaction, so the fees stay those of the passing layout.
