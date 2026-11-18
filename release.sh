@@ -206,6 +206,21 @@ push_node_root_tag() {
 		die "node: expected $1 $VERSION tags on origin, found $count"
 }
 
+# Build the root module from a clean export of the local $VERSION tag outside
+# any workspace, the way a checkout of the release tag builds. `go install
+# $NODE_MOD@$VERSION` passes even when the tag's go.sum is stale.
+check_root_tag_builds() {
+	local tmp
+	tmp=$(mktemp -d)
+	log "node: building $VERSION from a clean checkout of the tag"
+	if ! (git -C "$NODE_DIR" archive "$VERSION" | tar -x -C "$tmp" &&
+		cd "$tmp" && "${GO_DIRECT[@]}" GOFLAGS=-mod=readonly go build ./...); then
+		rm -rf "$tmp"
+		die "node: $VERSION does not build from a clean checkout of the tag"
+	fi
+	rm -rf "$tmp"
+}
+
 release_node() {
 	local expected count mod tags=()
 	expected=$(node_modules | wc -l | tr -d ' ')
@@ -245,6 +260,7 @@ release_node() {
 			tag_commit "$NODE_DIR" "$(node_tag_name "$mod")"
 			[ "$mod" = . ] || tags+=("refs/tags/$(node_tag_name "$mod")")
 		done <<<"$(node_modules)"
+		check_root_tag_builds
 
 		confirm "Push node main + $expected $VERSION tags to origin?"
 		log "node: pushing main and ${#tags[@]} submodule tags"
