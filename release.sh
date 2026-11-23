@@ -7,10 +7,11 @@
 #
 # Steps:
 #   node:    bump all internal requires + internal/version to vX.Y.Z, build,
-#            test, commit, tag every module + root, push main and submodule
-#            tags in one atomic push, then the root tag on its own, verify `go install` from outside the workspace, then
-#            commit the post-tag `go mod tidy` (go.sum can only be filled once
-#            the tags exist).
+#            test, commit, tag every submodule, push main and the submodule
+#            tags in one atomic push, then `go mod tidy` against those tags
+#            and commit; tag the root on that commit, check that the tag
+#            builds from a clean checkout, push main and the root tag on its
+#            own, verify `go install` from outside the workspace.
 #   wallet,  bump monetarium-node requires, tidy, set version constants, build
 #   ctl:     with GOWORK=off, commit, tag, push.
 #
@@ -128,11 +129,10 @@ bump_requires() {
 	perl -pi -e 's{(\Q'"$NODE_MOD"'\E(?:/[\w./-]+)?) v\d+\.\d+\.\d+(?=\s|$)}{$1 '"$VERSION"'}g' "$@"
 }
 
-# Create an annotated tag at the given commit (default HEAD) unless it already
-# exists there.
+# Create an annotated tag at HEAD unless it already exists there.
 tag_commit() {
 	local dir=$1 tag=$2 commit at
-	commit=$(git -C "$dir" rev-parse "${3:-HEAD}^{commit}")
+	commit=$(git -C "$dir" rev-parse "HEAD^{commit}")
 	if at=$(git -C "$dir" rev-parse -q --verify "refs/tags/$tag^{commit}"); then
 		[ "$at" = "$commit" ] ||
 			die "$dir: local tag $tag exists at another commit; delete it (git tag -d $tag) and rerun"
@@ -206,6 +206,21 @@ push_node_root_tag() {
 		die "node: expected $1 $VERSION tags on origin, found $count"
 }
 
+# Build the root module from a clean export of the local $VERSION tag outside
+# any workspace, the way a checkout of the release tag builds. `go install
+# $NODE_MOD@$VERSION` passes even when the tag's go.sum is stale.
+check_root_tag_builds() {
+	local tmp
+	tmp=$(mktemp -d)
+	log "node: building $VERSION from a clean checkout of the tag"
+	if ! (git -C "$NODE_DIR" archive "$VERSION" | tar -x -C "$tmp" &&
+		cd "$tmp" && "${GO_DIRECT[@]}" GOFLAGS=-mod=readonly go build ./...); then
+		rm -rf "$tmp"
+		die "node: $VERSION does not build from a clean checkout of the tag"
+	fi
+	rm -rf "$tmp"
+}
+
 release_node() {
 	local expected count mod tags=()
 	expected=$(node_modules | wc -l | tr -d ' ')
@@ -214,41 +229,67 @@ release_node() {
 
 	if [ "$count" -eq "$expected" ]; then
 		log "node: $VERSION already tagged on origin, skipping to verification"
-	elif [ "$count" -eq $((expected - 1)) ]; then
-		log "node: submodule tags already on origin, pushing the root tag"
-		tag_commit "$NODE_DIR" "$VERSION" "$(node_tag_name chaincfg)"
-		push_node_root_tag "$expected"
 	else
-		if [ "$(git log -1 --format=%s)" != "$NODE_BUMP_MSG" ]; then
-			log "node: bumping internal deps and version to $VERSION"
-			# shellcheck disable=SC2046
-			bump_requires $(find . -name go.mod -not -path './vendor/*')
-			perl -pi -e 's/^(\s*Version\s*=\s*)"[^"]*"/$1"'"${VERSION#v}"'"/' internal/version/version.go
-			grep -q "Version = \"${VERSION#v}\"" internal/version/version.go ||
-				die "node: failed to set Version in internal/version/version.go"
+		if [ "$count" -eq $((expected - 1)) ]; then
+			log "node: submodule tags already on origin"
+		else
+			if [ "$(git log -1 --format=%s)" != "$NODE_BUMP_MSG" ]; then
+				log "node: bumping internal deps and version to $VERSION"
+				# shellcheck disable=SC2046
+				bump_requires $(find . -name go.mod -not -path './vendor/*')
+				perl -pi -e 's/^(\s*Version\s*=\s*)"[^"]*"/$1"'"${VERSION#v}"'"/' internal/version/version.go
+				grep -q "Version = \"${VERSION#v}\"" internal/version/version.go ||
+					die "node: failed to set Version in internal/version/version.go"
 
-			local gowork
-			gowork=$(mktemp -d)/go.work
-			write_release_gowork "$gowork"
-			log "node: build"
-			GOWORK="$gowork" go build ./...
-			if [ "${SKIP_TESTS:-}" != 1 ]; then
-				log "node: tests"
-				GOWORK="$gowork" go test ./chaincfg/... ./internal/blockchain/... \
-					./internal/mempool/... ./cointype/...
+				local gowork
+				gowork=$(mktemp -d)/go.work
+				write_release_gowork "$gowork"
+				log "node: build"
+				GOWORK="$gowork" go build ./...
+				if [ "${SKIP_TESTS:-}" != 1 ]; then
+					log "node: tests"
+					GOWORK="$gowork" go test ./chaincfg/... ./internal/blockchain/... \
+						./internal/mempool/... ./cointype/...
+				fi
+				rm -rf "$(dirname "$gowork")"
+				git commit --quiet -am "$NODE_BUMP_MSG"
 			fi
-			rm -rf "$(dirname "$gowork")"
-			git commit --quiet -am "$NODE_BUMP_MSG"
+
+			while read -r mod; do
+				[ "$mod" = . ] && continue
+				tag_commit "$NODE_DIR" "$(node_tag_name "$mod")"
+				tags+=("refs/tags/$(node_tag_name "$mod")")
+			done <<<"$(node_modules)"
+
+			confirm "Push node main + ${#tags[@]} submodule $VERSION tags to origin?"
+			log "node: pushing main and ${#tags[@]} submodule tags"
+			"${GIT[@]}" push --atomic origin main "${tags[@]}"
 		fi
 
+		# The root tag goes on the commit that fills go.sum, and filling it
+		# needs the submodule tags on origin. Nothing but that commit may sit
+		# between them, or the root would ship code the submodule tags lack.
+		local extra
+		extra=$(git log --format=%s "$(node_tag_name chaincfg)..HEAD" | grep -vxF "$NODE_TIDY_MSG" || true)
+		[ -z "$extra" ] ||
+			die "node: main has commits after the $VERSION submodule tags; pick a newer version"
+		log "node: refreshing go.sum against the published submodule tags"
 		while read -r mod; do
-			tag_commit "$NODE_DIR" "$(node_tag_name "$mod")"
-			[ "$mod" = . ] || tags+=("refs/tags/$(node_tag_name "$mod")")
+			case "$mod" in */_*) continue ;; esac
+			if ! (cd "$NODE_DIR/$mod" && "${GO_DIRECT[@]}" go mod tidy); then
+				git checkout --quiet -- .
+				die "node: go mod tidy failed in $mod; fix the cause and rerun"
+			fi
 		done <<<"$(node_modules)"
+		if ! git diff --quiet; then
+			git commit --quiet -am "$NODE_TIDY_MSG"
+		fi
+		tag_commit "$NODE_DIR" "$VERSION"
+		check_root_tag_builds
 
-		confirm "Push node main + $expected $VERSION tags to origin?"
-		log "node: pushing main and ${#tags[@]} submodule tags"
-		"${GIT[@]}" push --atomic origin main "${tags[@]}"
+		confirm "Push node main + the root $VERSION tag to origin?"
+		log "node: pushing main"
+		"${GIT[@]}" push origin main
 		push_node_root_tag "$expected"
 	fi
 
@@ -257,18 +298,6 @@ release_node() {
 	tmp=$(mktemp -d)
 	(cd "$tmp" && "${GO_DIRECT[@]}" GOBIN="$tmp/bin" go install "$NODE_MOD@$VERSION")
 	rm -rf "$tmp"
-
-	log "node: refreshing go.sum against the published tags"
-	while read -r mod; do
-		case "$mod" in */_*) continue ;; esac
-		(cd "$NODE_DIR/$mod" && "${GO_DIRECT[@]}" go mod tidy)
-	done <<<"$(node_modules)"
-	if ! git diff --quiet; then
-		git commit --quiet -am "$NODE_TIDY_MSG"
-	fi
-	if [ -n "$(git log --format=%h origin/main..HEAD)" ]; then
-		"${GIT[@]}" push origin main
-	fi
 }
 
 # Set the app version in wallet (Major/Minor/Patch consts) or ctl (Version string).
