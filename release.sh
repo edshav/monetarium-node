@@ -269,6 +269,8 @@ release_node() {
 		# The root tag goes on the commit that fills go.sum, and filling it
 		# needs the submodule tags on origin. Nothing but that commit may sit
 		# between them, or the root would ship code the submodule tags lack.
+		git merge-base --is-ancestor "$(node_tag_name chaincfg)" HEAD ||
+			die "node: origin/main does not contain the $VERSION submodule tags; pick a newer version"
 		local extra
 		extra=$(git log --format=%s "$(node_tag_name chaincfg)..HEAD" | grep -vxF "$NODE_TIDY_MSG" || true)
 		[ -z "$extra" ] ||
